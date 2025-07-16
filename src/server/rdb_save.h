@@ -7,7 +7,6 @@
 
 extern "C" {
 #include "redis/lzfP.h"
-#include "redis/quicklist.h"
 }
 
 #include <optional>
@@ -78,6 +77,7 @@ class RdbSaver {
   struct GlobalData {
     const StringVec lua_scripts;     // bodies of lua scripts
     const StringVec search_indices;  // ft.create commands to re-create search indices
+    size_t table_used_memory = 0;    // total memory used by all tables in all shards
   };
 
   // single_shard - true means that we run RdbSaver on a single shard and we do not use
@@ -85,7 +85,9 @@ class RdbSaver {
   // single_shard - false, means we capture all the data using a single RdbSaver instance
   // (corresponds to legacy, redis compatible mode)
   // if align_writes is true - writes data in aligned chunks of 4KB to fit direct I/O requirements.
-  explicit RdbSaver(::io::Sink* sink, SaveMode save_mode, bool align_writes);
+  // snapshot_id - allows to identify that group of files belongs to the same snapshot
+  explicit RdbSaver(::io::Sink* sink, SaveMode save_mode, bool align_writes,
+                    std::string snapshot_id);
 
   ~RdbSaver();
 
@@ -147,11 +149,12 @@ class RdbSaver {
   std::unique_ptr<Impl> impl_;
   SaveMode save_mode_;
   CompressionMode compression_mode_;
+  std::string snapshot_id_;
 };
 
 class SerializerBase {
  public:
-  enum class FlushState { kFlushMidEntry, kFlushEndEntry };
+  enum class FlushState : uint8_t { kFlushMidEntry, kFlushEndEntry };
 
   explicit SerializerBase(CompressionMode compression_mode);
   virtual ~SerializerBase() = default;
@@ -255,10 +258,8 @@ class RdbSerializer : public SerializerBase {
 
   std::error_code SaveLongLongAsString(int64_t value);
   std::error_code SaveBinaryDouble(double val);
-  std::error_code SaveListPackAsZiplist(uint8_t* lp);
   std::error_code SaveStreamPEL(rax* pel, bool nacks);
   std::error_code SaveStreamConsumers(bool save_active, streamCG* cg);
-  std::error_code SavePlainNodeAsZiplist(const quicklistNode* node);
 
   // Might preempt
   void FlushIfNeeded(FlushState flush_state);

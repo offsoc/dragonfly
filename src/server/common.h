@@ -136,7 +136,7 @@ extern std::atomic_uint64_t rss_mem_peak;
 
 extern size_t max_memory_limit;
 
-size_t FetchRssMemory(io::StatusData sdata);
+size_t FetchRssMemory(const io::StatusData& sdata);
 
 extern Namespaces* namespaces;
 
@@ -320,7 +320,7 @@ struct ScanOpts {
     Untouched,  // untouched, the key has not been accessed/touched.
   };
   std::optional<Mask> mask;
-
+  size_t min_malloc_size = 0;
   bool Matches(std::string_view val_name) const;
   static OpResult<ScanOpts> TryFrom(CmdArgList args);
 };
@@ -331,13 +331,6 @@ constexpr uint64_t kMemberExpiryBase = 1675209600;
 inline uint32_t MemberTimeSeconds(uint64_t now_ms) {
   return (now_ms / 1000) - kMemberExpiryBase;
 }
-
-struct MemoryBytesFlag {
-  uint64_t value = 0;
-};
-
-bool AbslParseFlag(std::string_view in, dfly::MemoryBytesFlag* flag, std::string* err);
-std::string AbslUnparseFlag(const dfly::MemoryBytesFlag& flag);
 
 // Helper class used to guarantee atomicity between serialization of buckets
 class ABSL_LOCKABLE ThreadLocalMutex {

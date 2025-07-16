@@ -4,6 +4,7 @@
 
 #include "server/main_service.h"
 
+#include "absl/strings/str_split.h"
 #include "facade/resp_expr.h"
 #include "util/fibers/synchronization.h"
 
@@ -96,7 +97,7 @@ ABSL_FLAG(bool, admin_nopass, false,
 ABSL_FLAG(bool, expose_http_api, false,
           "If set, will expose a POST /api handler for sending redis commands as json array.");
 
-ABSL_FLAG(dfly::MemoryBytesFlag, maxmemory, dfly::MemoryBytesFlag{},
+ABSL_FLAG(facade::MemoryBytesFlag, maxmemory, facade::MemoryBytesFlag{},
           "Limit on maximum-memory that is used by the database. "
           "0 - means the program will automatically determine its maximum memory usage. "
           "default: 0");
@@ -115,6 +116,13 @@ ABSL_FLAG(size_t, serialization_max_chunk_size, 64_KB,
           "Maximum size of a value that may be serialized at once during snapshotting or full "
           "sync. Values bigger than this threshold will be serialized using streaming "
           "serialization. 0 - to disable streaming mode");
+ABSL_FLAG(uint32_t, max_squashed_cmd_num, 100,
+          "Max number of commands squashed in a single shard during squash optimizaiton");
+
+ABSL_FLAG(string, huffman_table, "",
+          "a comma separated map: domain1:code1,domain2:code2,... where "
+          "domain can currently be only KEYS, code is base64 encoded huffman table exported via "
+          "DEBUG COMPRESSION EXPORT. if empty no huffman compression is appplied.");
 
 namespace dfly {
 
@@ -284,10 +292,10 @@ void DispatchMonitor(ConnectionContext* cntx, const CommandId* cid, CmdArgList t
 
 class InterpreterReplier : public RedisReplyBuilder {
  public:
-  InterpreterReplier(ObjectExplorer* explr) : RedisReplyBuilder(nullptr), explr_(explr) {
+  explicit InterpreterReplier(ObjectExplorer* explr) : RedisReplyBuilder(nullptr), explr_(explr) {
   }
 
-  void SendError(std::string_view str, std::string_view type = std::string_view{}) final;
+  void SendError(std::string_view str, std::string_view type) final;
 
   void SendBulkString(std::string_view str) final;
   void SendSimpleString(std::string_view str) final;
@@ -310,7 +318,7 @@ class InterpreterReplier : public RedisReplyBuilder {
 // Serialized result of script invocation to Redis protocol
 class EvalSerializer : public ObjectExplorer {
  public:
-  EvalSerializer(RedisReplyBuilder* rb) : rb_(rb) {
+  explicit EvalSerializer(RedisReplyBuilder* rb) : rb_(rb) {
   }
 
   void OnBool(bool b) final {
@@ -440,11 +448,8 @@ void InterpreterReplier::StartCollection(unsigned len, CollectionType type) {
 }
 
 bool IsSHA(string_view str) {
-  for (auto c : str) {
-    if (!absl::ascii_isxdigit(c))
-      return false;
-  }
-  return true;
+  return std::all_of(str.begin(), str.end(),
+                     [](unsigned char c) { return absl::ascii_isxdigit(c); });
 }
 
 optional<ErrorReply> EvalValidator(CmdArgList args) {
@@ -634,9 +639,8 @@ Transaction::MultiMode DeduceExecMode(ExecScriptUse state,
       // We can only tell if eval is transactional based on they keycount
       if (absl::StartsWith(scmd.Cid()->name(), "EVAL")) {
         CmdArgVec arg_vec{};
-        StoredCmd cmd = scmd;
-        cmd.Fill(&arg_vec);
-        auto keys = DetermineKeys(scmd.Cid(), absl::MakeSpan(arg_vec));
+        auto args = scmd.ArgList(&arg_vec);
+        auto keys = DetermineKeys(scmd.Cid(), args);
         transactional |= (keys && keys.value().NumArgs() > 0);
       } else {
         transactional |= scmd.Cid()->IsTransactional();
@@ -708,6 +712,51 @@ void SetSerializationMaxChunkSize(size_t val) {
   shard_set->pool()->AwaitBrief(cb);
 }
 
+void SetMaxSquashedCmdNum(int32_t val) {
+  auto cb = [val](unsigned, auto*) { ServerState::tlocal()->max_squash_cmd_num = val; };
+  shard_set->pool()->AwaitBrief(cb);
+}
+
+void SetHuffmanTable(const std::string& huffman_table) {
+  if (huffman_table.empty())
+    return;
+  vector<string_view> parts = absl::StrSplit(huffman_table, ',');
+  for (const auto& part : parts) {
+    vector<string_view> kv = absl::StrSplit(part, ':');
+    if (kv.size() != 2 || kv[0].empty() || kv[1].empty()) {
+      LOG(ERROR) << "Invalid huffman table entry" << part;
+      continue;
+    }
+    string domain_str = absl::AsciiStrToUpper(kv[0]);
+    CompactObj::HuffmanDomain domain;
+
+    if (domain_str == "KEYS") {
+      domain = CompactObj::HUFF_KEYS;
+    } else if (domain_str == "STRINGS") {
+      domain = CompactObj::HUFF_STRING_VALUES;
+    } else {
+      LOG(ERROR) << "Unknown huffman domain: " << kv[0];
+      continue;
+    }
+
+    string unescaped;
+    if (!absl::Base64Unescape(kv[1], &unescaped)) {
+      LOG(ERROR) << "Failed to decode base64 huffman table for domain " << kv[0] << " with value "
+                 << kv[1];
+      continue;
+    }
+
+    atomic_bool success = true;
+    shard_set->RunBriefInParallel([&](auto* shard) {
+      if (!CompactObj::InitHuffmanThreadLocal(domain, unescaped)) {
+        success = false;
+      }
+    });
+    LOG_IF(ERROR, !success) << "Failed to set huffman table for domain " << kv[0] << " with value "
+                            << kv[1];
+  }
+}
+
 }  // namespace
 
 Service::Service(ProactorPool* pp)
@@ -777,6 +826,8 @@ void Service::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> 
 
   config_registry.RegisterMutable("pipeline_squash");
 
+  config_registry.RegisterMutable("lua_mem_gc_threshold");
+
   config_registry.RegisterSetter<uint32_t>("pipeline_queue_limit", [](uint32_t val) {
     shard_set->pool()->AwaitBrief(
         [val](unsigned tid, auto*) { facade::Connection::SetMaxQueueLenThreadLocal(tid, val); });
@@ -786,6 +837,9 @@ void Service::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> 
     shard_set->pool()->AwaitBrief(
         [val](unsigned tid, auto*) { facade::Connection::SetPipelineBufferLimit(tid, val); });
   });
+
+  config_registry.RegisterSetter<uint32_t>("max_squashed_cmd_num",
+                                           [](uint32_t val) { SetMaxSquashedCmdNum(val); });
 
   config_registry.RegisterMutable("replica_partial_sync");
   config_registry.RegisterMutable("replication_timeout");
@@ -857,6 +911,8 @@ void Service::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> 
 
   SetRssOomDenyRatioOnAllThreads(absl::GetFlag(FLAGS_rss_oom_deny_ratio));
   SetSerializationMaxChunkSize(absl::GetFlag(FLAGS_serialization_max_chunk_size));
+  SetMaxSquashedCmdNum(absl::GetFlag(FLAGS_max_squashed_cmd_num));
+  SetHuffmanTable(absl::GetFlag(FLAGS_huffman_table));
 
   // Requires that shard_set will be initialized before because server_family_.Init might
   // load the snapshot.
@@ -993,11 +1049,10 @@ static optional<ErrorReply> VerifyConnectionAclStatus(const CommandId* cid,
   return nullopt;
 }
 
-bool ShouldDenyOnOOM(const CommandId* cid) {
+bool ShouldDenyOnOOM(const CommandId* cid, uint64_t curr_time_ns) {
   ServerState& etl = *ServerState::tlocal();
   if ((cid->opt_mask() & CO::DENYOOM) && etl.is_master) {
-    uint64_t start_ns = absl::GetCurrentTimeNanos();
-    auto memory_stats = etl.GetMemoryUsage(start_ns);
+    auto memory_stats = etl.GetMemoryUsage(curr_time_ns);
 
     if (memory_stats.used_mem > max_memory_limit ||
         (etl.rss_oom_deny_ratio > 0 &&
@@ -1011,14 +1066,14 @@ bool ShouldDenyOnOOM(const CommandId* cid) {
   return false;
 }
 
-optional<ErrorReply> Service::VerifyCommandExecution(const CommandId* cid,
-                                                     const ConnectionContext* cntx,
+optional<ErrorReply> Service::VerifyCommandExecution(const ConnectionContext* cntx,
                                                      CmdArgList tail_args) {
-  if (ShouldDenyOnOOM(cid)) {
-    return facade::ErrorReply{kOutOfMemory};
+  DCHECK(cntx->conn_state.cmd_start_time_ns);
+  if (ShouldDenyOnOOM(cntx->cid, cntx->conn_state.cmd_start_time_ns)) {
+    return facade::ErrorReply{OpStatus::OUT_OF_MEMORY};
   }
 
-  return VerifyConnectionAclStatus(cid, cntx, "ACL rules changed between the MULTI and EXEC",
+  return VerifyConnectionAclStatus(cntx->cid, cntx, "ACL rules changed between the MULTI and EXEC",
                                    tail_args);
 }
 
@@ -1091,11 +1146,9 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId* cid, CmdA
     return ErrorReply{"-READONLY You can't write against a read only replica."};
 
   if (multi_active) {
-    if (absl::EndsWith(cmd_name, "SUBSCRIBE"))
-      return ErrorReply{absl::StrCat("Can not call ", cmd_name, " within a transaction")};
-
-    if (cmd_name == "WATCH" || cmd_name == "FLUSHALL" || cmd_name == "FLUSHDB")
-      return ErrorReply{absl::StrCat("'", cmd_name, "' inside MULTI is not allowed")};
+    if (cmd_name == "WATCH" || cmd_name == "FLUSHALL" || cmd_name == "FLUSHDB" ||
+        absl::EndsWith(cmd_name, "SUBSCRIBE"))
+      return ErrorReply{absl::StrCat("'", cmd_name, "' not allowed inside a transaction")};
   }
 
   if (IsClusterEnabled()) {
@@ -1133,8 +1186,8 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId* cid, CmdA
   return VerifyConnectionAclStatus(cid, &dfly_cntx, "has no ACL permissions", tail_args);
 }
 
-void Service::DispatchCommand(ArgSlice args, SinkReplyBuilder* builder,
-                              facade::ConnectionContext* cntx) {
+DispatchResult Service::DispatchCommand(ArgSlice args, SinkReplyBuilder* builder,
+                                        facade::ConnectionContext* cntx) {
   DCHECK(!args.empty());
   DCHECK_NE(0u, shard_set->size()) << "Init was not called";
 
@@ -1145,7 +1198,8 @@ void Service::DispatchCommand(ArgSlice args, SinkReplyBuilder* builder,
   const auto [cid, args_no_cmd] = registry_.FindExtended(cmd, args.subspan(1));
 
   if (cid == nullptr) {
-    return builder->SendError(ReportUnknownCmd(cmd));
+    builder->SendError(ReportUnknownCmd(cmd));
+    return DispatchResult::ERROR;
   }
 
   ConnectionContext* dfly_cntx = static_cast<ConnectionContext*>(cntx);
@@ -1170,6 +1224,7 @@ void Service::DispatchCommand(ArgSlice args, SinkReplyBuilder* builder,
   }
 
   if (auto err = VerifyCommandState(cid, args_no_cmd, *dfly_cntx); err) {
+    LOG_IF(WARNING, cntx->replica_conn) << "VerifyCommandState error: " << err->ToSv();
     if (auto& exec_info = dfly_cntx->conn_state.exec_info; exec_info.IsCollecting())
       exec_info.state = ConnectionState::ExecInfo::EXEC_ERROR;
 
@@ -1178,10 +1233,10 @@ void Service::DispatchCommand(ArgSlice args, SinkReplyBuilder* builder,
     // their access revoked and reinstated
     if (cid->name() == "REPLCONF" && absl::EqualsIgnoreCase(ArgS(args_no_cmd, 0), "ACK")) {
       server_family_.GetDflyCmd()->OnClose(dfly_cntx->conn_state.replication_info.repl_session_id);
-      return;
+      return DispatchResult::ERROR;
     }
     builder->SendError(std::move(*err));
-    return;
+    return DispatchResult::ERROR;
   }
 
   VLOG_IF(1, cid->opt_mask() & CO::CommandOpt::DANGEROUS)
@@ -1191,12 +1246,12 @@ void Service::DispatchCommand(ArgSlice args, SinkReplyBuilder* builder,
   bool is_trans_cmd = CO::IsTransKind(cid->name());
   if (dfly_cntx->conn_state.exec_info.IsCollecting() && !is_trans_cmd) {
     // TODO: protect against aggregating huge transactions.
-    StoredCmd stored_cmd{cid, args_no_cmd};
-    dfly_cntx->conn_state.exec_info.body.push_back(std::move(stored_cmd));
-    if (stored_cmd.Cid()->IsWriteOnly()) {
+    dfly_cntx->conn_state.exec_info.body.emplace_back(cid, true, args_no_cmd);
+    if (cid->IsWriteOnly()) {
       dfly_cntx->conn_state.exec_info.is_write = true;
     }
-    return builder->SendSimpleString("QUEUED");
+    builder->SendSimpleString("QUEUED");
+    return DispatchResult::OK;
   }
 
   // Create command transaction
@@ -1209,8 +1264,10 @@ void Service::DispatchCommand(ArgSlice args, SinkReplyBuilder* builder,
       OpStatus status = dfly_cntx->transaction->InitByArgs(
           dfly_cntx->ns, dfly_cntx->conn_state.db_index, args_no_cmd);
 
-      if (status != OpStatus::OK)
-        return builder->SendError(status);
+      if (status != OpStatus::OK) {
+        builder->SendError(status);
+        return DispatchResult::ERROR;
+      }
     }
   } else {
     DCHECK(dfly_cntx->transaction == nullptr);
@@ -1222,8 +1279,10 @@ void Service::DispatchCommand(ArgSlice args, SinkReplyBuilder* builder,
         CHECK(dfly_cntx->ns != nullptr);
         if (auto st =
                 dist_trans->InitByArgs(dfly_cntx->ns, dfly_cntx->conn_state.db_index, args_no_cmd);
-            st != OpStatus::OK)
-          return builder->SendError(st);
+            st != OpStatus::OK) {
+          builder->SendError(st);
+          return DispatchResult::ERROR;
+        }
       }
 
       dfly_cntx->transaction = dist_trans.get();
@@ -1235,13 +1294,9 @@ void Service::DispatchCommand(ArgSlice args, SinkReplyBuilder* builder,
 
   dfly_cntx->cid = cid;
 
-  // If cmd is an alias, pass it to Invoke so the stats are updated against the alias. By defaults
-  // stats will be updated for cid.name
-  std::optional<std::string_view> orig_cmd_name = std::nullopt;
-  if (registry_.IsAlias(cmd)) {
-    orig_cmd_name = cmd;
-  }
-  if (!InvokeCmd(cid, args_no_cmd, builder, dfly_cntx, orig_cmd_name)) {
+  auto res =
+      InvokeCmd(cid, args_no_cmd, CommandContext{dfly_cntx->transaction, builder, dfly_cntx});
+  if ((res != DispatchResult::OK) && (res != DispatchResult::OOM)) {
     builder->SendError("Internal Error");
     builder->CloseConnection();
   }
@@ -1249,6 +1304,7 @@ void Service::DispatchCommand(ArgSlice args, SinkReplyBuilder* builder,
   if (!dispatching_in_multi) {
     dfly_cntx->transaction = nullptr;
   }
+  return res;
 }
 
 class ReplyGuard {
@@ -1301,21 +1357,33 @@ OpResult<void> OpTrackKeys(const OpArgs slice_args, const facade::Connection::We
   return OpStatus::OK;
 }
 
-bool Service::InvokeCmd(const CommandId* cid, CmdArgList tail_args, SinkReplyBuilder* builder,
-                        ConnectionContext* cntx, std::optional<std::string_view> orig_cmd_name) {
+DispatchResult Service::InvokeCmd(const CommandId* cid, CmdArgList tail_args,
+                                  const CommandContext& cmd_cntx) {
   DCHECK(cid);
   DCHECK(!cid->Validate(tail_args));
 
-  if (auto err = VerifyCommandExecution(cid, cntx, tail_args); err) {
+  ConnectionContext* cntx = cmd_cntx.conn_cntx;
+  cntx->cid = cid;
+  cntx->conn_state.cmd_start_time_ns = absl::GetCurrentTimeNanos();
+  auto* builder = cmd_cntx.rb;
+  DCHECK(builder);
+  DCHECK(cntx);
+
+  if (auto err = VerifyCommandExecution(cntx, tail_args); err) {
     // We need to skip this because ACK's should not be replied to
     // Bonus points because this allows to continue replication with ACL users who got
     // their access revoked and reinstated
     if (cid->name() == "REPLCONF" && absl::EqualsIgnoreCase(ArgS(tail_args, 0), "ACK")) {
-      return true;
+      return DispatchResult::OK;
     }
+    auto res = err->status;
     builder->SendError(std::move(*err));
     builder->ConsumeLastError();
-    return true;  // return false only for internal error aborts
+    if (res == OpStatus::OUT_OF_MEMORY) {
+      return DispatchResult::OOM;
+    }
+
+    return DispatchResult::OK;  // return ERROR only for internal error aborts
   }
 
   // We are not sending any admin command in the monitor, and we do not want to
@@ -1326,9 +1394,9 @@ bool Service::InvokeCmd(const CommandId* cid, CmdArgList tail_args, SinkReplyBui
   }
 
   ServerState::tlocal()->RecordCmd(cntx->has_main_or_memcache_listener);
-  Transaction* tx = cntx->transaction;
   auto& info = cntx->conn_state.tracking_info_;
   const bool is_read_only = cid->opt_mask() & CO::READONLY;
+  Transaction* tx = cmd_cntx.tx;
   if (tx) {
     // Reset it, because in multi/exec the transaction pointer is the same and
     // we will end up triggerring the callback on the following commands. To avoid this
@@ -1351,14 +1419,18 @@ bool Service::InvokeCmd(const CommandId* cid, CmdArgList tail_args, SinkReplyBui
   auto last_error = builder->ConsumeLastError();
   DCHECK(last_error.empty());
   try {
-    invoke_time_usec = cid->Invoke(tail_args, CommandContext{tx, builder, cntx},
-                                   orig_cmd_name.value_or(cid->name()));
+    invoke_time_usec = cid->Invoke(tail_args, cmd_cntx);
   } catch (std::exception& e) {
     LOG(ERROR) << "Internal error, system probably unstable " << e.what();
-    return false;
+    return DispatchResult::ERROR;
   }
 
+  DispatchResult res = DispatchResult::OK;
   if (std::string reason = builder->ConsumeLastError(); !reason.empty()) {
+    // Set flag if OOM reported
+    if (reason == kOutOfMemory) {
+      res = DispatchResult::OOM;
+    }
     VLOG(2) << FailedCommandToString(cid->name(), tail_args, reason);
     LOG_EVERY_T(WARNING, 1) << FailedCommandToString(cid->name(), tail_args, reason);
   }
@@ -1401,7 +1473,7 @@ bool Service::InvokeCmd(const CommandId* cid, CmdArgList tail_args, SinkReplyBui
     cntx->last_command_debug.clock = tx->txid();
   }
 
-  return true;
+  return res;
 }
 
 size_t Service::DispatchManyCommands(absl::Span<CmdArgList> args_list, SinkReplyBuilder* builder,
@@ -1410,11 +1482,14 @@ size_t Service::DispatchManyCommands(absl::Span<CmdArgList> args_list, SinkReply
   DCHECK(!dfly_cntx->conn_state.exec_info.IsRunning());
   DCHECK_EQ(builder->GetProtocol(), Protocol::REDIS);
 
+  auto* ss = dfly::ServerState::tlocal();
+  // Don't even start when paused. We can only continue if DispatchTracker is aware of us running.
+  if (ss->IsPaused())
+    return 0;
+
   vector<StoredCmd> stored_cmds;
   intrusive_ptr<Transaction> dist_trans;
-
   size_t dispatched = 0;
-  auto* ss = dfly::ServerState::tlocal();
 
   auto perform_squash = [&] {
     if (stored_cmds.empty())
@@ -1429,19 +1504,19 @@ size_t Service::DispatchManyCommands(absl::Span<CmdArgList> args_list, SinkReply
     }
 
     dfly_cntx->transaction = dist_trans.get();
+    MultiCommandSquasher::Opts opts;
+    opts.verify_commands = true;
+    opts.max_squash_size = ss->max_squash_cmd_num;
+
     size_t squashed_num = MultiCommandSquasher::Execute(absl::MakeSpan(stored_cmds),
                                                         static_cast<RedisReplyBuilder*>(builder),
-                                                        dfly_cntx, this, true, false);
+                                                        dfly_cntx, this, opts);
     dfly_cntx->transaction = nullptr;
 
     dispatched += stored_cmds.size();
     ss->stats.squashed_commands += squashed_num;
     stored_cmds.clear();
   };
-
-  // Don't even start when paused. We can only continue if DispatchTracker is aware of us running.
-  if (ss->IsPaused())
-    return 0;
 
   for (auto args : args_list) {
     string cmd = absl::AsciiStrToUpper(ArgS(args, 0));
@@ -1462,7 +1537,7 @@ size_t Service::DispatchManyCommands(absl::Span<CmdArgList> args_list, SinkReply
 
     if (!is_multi && !is_eval && !is_blocking && cid != nullptr) {
       stored_cmds.reserve(args_list.size());
-      stored_cmds.emplace_back(cid, tail_args);
+      stored_cmds.emplace_back(cid, false /* do not deep-copy commands*/, tail_args);
       continue;
     }
 
@@ -1532,7 +1607,14 @@ void Service::DispatchMC(const MemcacheParser::Command& cmd, std::string_view va
     case MemcacheParser::PREPEND:
       strcpy(cmd_name, "PREPEND");
       break;
+    case MemcacheParser::GATS:
+      [[fallthrough]];
+    case MemcacheParser::GAT:
+      strcpy(cmd_name, "GAT");
+      break;
     case MemcacheParser::GET:
+      [[fallthrough]];
+    case MemcacheParser::GETS:
       strcpy(cmd_name, "MGET");
       break;
     case MemcacheParser::FLUSHALL:
@@ -1554,13 +1636,26 @@ void Service::DispatchMC(const MemcacheParser::Command& cmd, std::string_view va
 
   args.emplace_back(cmd_name, strlen(cmd_name));
 
+  // if expire_ts is greater than month it's a unix timestamp
+  // https://github.com/memcached/memcached/blob/master/doc/protocol.txt#L139
+  constexpr uint32_t kExpireLimit = 60 * 60 * 24 * 30;
+  const uint64_t expire_ts = cmd.expire_ts && cmd.expire_ts <= kExpireLimit
+                                 ? cmd.expire_ts + time(nullptr)
+                                 : cmd.expire_ts;
+
+  // For GAT/GATS commands, the expiry precedes the keys which will be looked up:
+  // GAT|GATS <expiry> key [key...]
+  if (cmd.type == MemcacheParser::GAT || cmd.type == MemcacheParser::GATS) {
+    char* next = absl::numbers_internal::FastIntToBuffer(expire_ts, ttl);
+    args.emplace_back(ttl, next - ttl);
+  }
+
   if (!cmd.key.empty()) {
     char* key = const_cast<char*>(cmd.key.data());
     args.emplace_back(key, cmd.key.size());
   }
 
   ConnectionContext* dfly_cntx = static_cast<ConnectionContext*>(cntx);
-
   if (MemcacheParser::IsStoreCmd(cmd.type)) {
     char* v = const_cast<char*>(value.data());
     args.emplace_back(v, value.size());
@@ -1569,12 +1664,6 @@ void Service::DispatchMC(const MemcacheParser::Command& cmd, std::string_view va
       args.emplace_back(store_opt, strlen(store_opt));
     }
 
-    // if expire_ts is greater than month it's a unix timestamp
-    // https://github.com/memcached/memcached/blob/master/doc/protocol.txt#L139
-    constexpr uint32_t kExpireLimit = 60 * 60 * 24 * 30;
-    const uint64_t expire_ts = cmd.expire_ts && cmd.expire_ts <= kExpireLimit
-                                   ? cmd.expire_ts + time(nullptr)
-                                   : cmd.expire_ts;
     if (expire_ts && memcmp(cmd_name, "SET", 3) == 0) {
       char* next = absl::numbers_internal::FastIntToBuffer(expire_ts, ttl);
       args.emplace_back(ttl_op, 4);
@@ -1585,6 +1674,9 @@ void Service::DispatchMC(const MemcacheParser::Command& cmd, std::string_view va
     for (auto s : cmd.keys_ext) {
       char* key = const_cast<char*>(s.data());
       args.emplace_back(key, s.size());
+    }
+    if (cmd.type == MemcacheParser::GETS || cmd.type == MemcacheParser::GATS) {
+      dfly_cntx->conn_state.memcache_flag |= ConnectionState::FETCH_CAS_VER;
     }
   } else {  // write commands.
     if (store_opt[0]) {
@@ -1621,7 +1713,13 @@ facade::ConnectionContext* Service::CreateContext(facade::Connection* owner) {
   } else if (owner->IsPrivileged() && RequirePrivilegedAuth()) {
     res->req_auth = !GetPassword().empty();
   } else if (!owner->IsPrivileged()) {
-    res->req_auth = !user_registry_.AuthUser("default", "");
+    // Memcached protocol doesn't support authentication, so we don't require it
+    if (owner->GetProtocol() == Protocol::MEMCACHE) {
+      res->req_auth = false;
+      res->authenticated = true;  // Automatically authenticated for Memcached protocol
+    } else {
+      res->req_auth = !user_registry_.AuthUser("default", "");
+    }
   }
 
   // a bit of a hack. I set up breaker callback here for the owner.
@@ -1732,7 +1830,11 @@ optional<CapturingReplyBuilder::Payload> Service::FlushEvalAsyncCmds(ConnectionC
   tx->MultiSwitchCmd(eval_cid);
 
   CapturingReplyBuilder crb{ReplyMode::ONLY_ERR};
-  MultiCommandSquasher::Execute(absl::MakeSpan(info->async_cmds), &crb, cntx, this, true, true);
+  MultiCommandSquasher::Opts opts;
+  opts.verify_commands = true;
+  opts.error_abort = true;
+  opts.max_squash_size = ServerState::tlocal()->max_squash_cmd_num;
+  MultiCommandSquasher::Execute(absl::MakeSpan(info->async_cmds), &crb, cntx, this, opts);
 
   info->async_cmds_heap_mem = 0;
   info->async_cmds.clear();
@@ -2032,6 +2134,8 @@ void Service::EvalInternal(CmdArgList args, const EvalArgs& eval_args, Interpret
 
   CHECK(result == Interpreter::RUN_OK);
 
+  // TODO(vlad): Investigate if using ReplyScope here is possible with a different serialization
+  // strategy due to currently SerializeResult destructuring a value while serializing
   SinkReplyBuilder::ReplyAggregator agg(builder);
   EvalSerializer ser{static_cast<RedisReplyBuilder*>(builder)};
   if (!interpreter->IsResultSafe()) {
@@ -2089,27 +2193,22 @@ bool CheckWatchedKeyExpiry(ConnectionContext* cntx, const CommandId* exists_cid,
 
 // Check if exec_info watches keys on dbs other than db_indx.
 bool IsWatchingOtherDbs(DbIndex db_indx, const ConnectionState::ExecInfo& exec_info) {
-  for (const auto& [key_db, _] : exec_info.watched_keys) {
-    if (key_db != db_indx) {
-      return true;
-    }
-  }
-  return false;
+  return std::any_of(exec_info.watched_keys.begin(), exec_info.watched_keys.end(),
+                     [db_indx](const auto& pair) { return pair.first != db_indx; });
 }
 
-template <typename F> void IterateAllKeys(ConnectionState::ExecInfo* exec_info, F&& f) {
+template <typename F> void IterateAllKeys(const ConnectionState::ExecInfo* exec_info, F&& f) {
   for (auto& [dbid, key] : exec_info->watched_keys)
     f(MutableSlice{key.data(), key.size()});
 
   CmdArgVec arg_vec{};
 
-  for (auto& scmd : exec_info->body) {
+  for (const auto& scmd : exec_info->body) {
     if (!scmd.Cid()->IsTransactional())
       continue;
 
-    scmd.Fill(&arg_vec);
-
-    auto key_res = DetermineKeys(scmd.Cid(), absl::MakeSpan(arg_vec));
+    auto args = scmd.ArgList(&arg_vec);
+    auto key_res = DetermineKeys(scmd.Cid(), args);
     if (!key_res.ok())
       continue;
 
@@ -2206,21 +2305,16 @@ void Service::Exec(CmdArgList args, const CommandContext& cmd_cntx) {
 
     if (absl::GetFlag(FLAGS_multi_exec_squash) && state != ExecScriptUse::SCRIPT_RUN &&
         !cntx->conn_state.tracking_info_.IsTrackingOn()) {
-      MultiCommandSquasher::Execute(absl::MakeSpan(exec_info.body), rb, cntx, this);
+      MultiCommandSquasher::Opts opts;
+      opts.max_squash_size = ServerState::tlocal()->max_squash_cmd_num;
+      MultiCommandSquasher::Execute(absl::MakeSpan(exec_info.body), rb, cntx, this, opts);
     } else {
       CmdArgVec arg_vec;
-      for (auto& scmd : exec_info.body) {
-        VLOG(2) << "TX CMD " << scmd.Cid()->name() << " " << scmd.NumArgs();
-
-        cmd_cntx.tx->MultiSwitchCmd(scmd.Cid());
-        cntx->cid = scmd.Cid();
-
-        arg_vec.resize(scmd.NumArgs());
-        scmd.Fill(&arg_vec);
-
-        CmdArgList args = absl::MakeSpan(arg_vec);
+      for (const auto& scmd : exec_info.body) {
+        CmdArgList args = scmd.ArgList(&arg_vec);
 
         if (scmd.Cid()->IsTransactional()) {
+          cmd_cntx.tx->MultiSwitchCmd(scmd.Cid());
           OpStatus st = cmd_cntx.tx->InitByArgs(cntx->ns, cntx->conn_state.db_index, args);
           if (st != OpStatus::OK) {
             rb->SendError(st);
@@ -2228,8 +2322,9 @@ void Service::Exec(CmdArgList args, const CommandContext& cmd_cntx) {
           }
         }
 
-        bool ok = InvokeCmd(scmd.Cid(), args, rb, cmd_cntx.conn_cntx);
-        if (!ok || rb->GetError())  // checks for i/o error, not logical error.
+        auto invoke_res = InvokeCmd(scmd.Cid(), args, cmd_cntx);
+        if ((invoke_res != DispatchResult::OK) ||
+            rb->GetError())  // checks for i/o error, not logical error.
           break;
       }
     }
@@ -2260,7 +2355,7 @@ void SubscribeImpl(bool reject_cluster, CmdArgList args, const CommandContext& c
   if (reject_cluster && IsClusterEnabled()) {
     return cmd_cntx.rb->SendError("SUBSCRIBE is not supported in cluster mode yet");
   }
-  cmd_cntx.conn_cntx->ChangeSubscription(true /*add*/, true /* reply*/, std::move(args),
+  cmd_cntx.conn_cntx->ChangeSubscription(true /*add*/, true /* reply*/, args,
                                          static_cast<RedisReplyBuilder*>(cmd_cntx.rb));
 }
 
@@ -2514,7 +2609,7 @@ VarzValue::Map Service::GetVarzStats() {
 
   res.emplace_back("keys", VarzValue::FromInt(db_stats.key_count));
   res.emplace_back("obj_mem_usage", VarzValue::FromInt(db_stats.obj_memory_usage));
-  double load = double(db_stats.key_count) / (1 + db_stats.bucket_count);
+  double load = double(db_stats.key_count) / (1 + db_stats.prime_capacity);
   res.emplace_back("table_load_factor", VarzValue::FromDouble(load));
 
   return res;
@@ -2593,6 +2688,9 @@ void Service::ConfigureHttpHandlers(util::HttpListenerBase* base, bool is_privil
 void Service::OnConnectionClose(facade::ConnectionContext* cntx) {
   ConnectionContext* server_cntx = static_cast<ConnectionContext*>(cntx);
   ConnectionState& conn_state = server_cntx->conn_state;
+  VLOG_IF(1, conn_state.replication_info.repl_session_id)
+      << "OnConnectionClose: " << server_cntx->conn()->GetName()
+      << ", repl_session_id: " << conn_state.replication_info.repl_session_id;
 
   if (conn_state.subscribe_info) {  // Clean-ups related to PUBSUB
     if (!conn_state.subscribe_info->channels.empty()) {

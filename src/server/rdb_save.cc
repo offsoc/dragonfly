@@ -14,13 +14,10 @@ extern "C" {
 #include "redis/crc64.h"
 #include "redis/intset.h"
 #include "redis/listpack.h"
-#include "redis/quicklist.h"
 #include "redis/rdb.h"
 #include "redis/stream.h"
 #include "redis/util.h"
-#include "redis/ziplist.h"
 #include "redis/zmalloc.h"
-#include "redis/zset.h"
 }
 
 #include "base/flags.h"
@@ -49,15 +46,8 @@ ABSL_FLAG(dfly::CompressionMode, compression_mode, dfly::CompressionMode::MULTI_
           "set 2 for multi entry zstd compression on df snapshot and single entry on rdb snapshot,"
           "set 3 for multi entry lz4 compression on df snapshot and single entry on rdb snapshot");
 
-ABSL_RETIRED_FLAG(
-    bool, list_rdb_encode_v2, true,
-    "V2 rdb encoding of list uses listpack encoding format, compatible with redis 7. V1 rdb "
-    "enconding of list uses ziplist encoding compatible with redis 6");
-
-// TODO: to retire this flag in v1.31
-ABSL_FLAG(bool, stream_rdb_encode_v2, true,
-          "V2 uses format, compatible with redis 7.2 and Dragonfly v1.26+, while v1 format "
-          "is compatible with redis 6");
+ABSL_RETIRED_FLAG(bool, stream_rdb_encode_v2, true,
+                  "Retired. Uses format, compatible with redis 7.2 and Dragonfly v1.26+");
 
 namespace dfly {
 
@@ -173,9 +163,7 @@ uint8_t RdbObjectType(const PrimeValue& pv) {
     case OBJ_STRING:
       return RDB_TYPE_STRING;
     case OBJ_LIST:
-      if (compact_enc == OBJ_ENCODING_QUICKLIST || compact_enc == kEncodingQL2) {
-        return RDB_TYPE_LIST_QUICKLIST_2;
-      }
+      return RDB_TYPE_LIST_QUICKLIST_2;
       break;
     case OBJ_SET:
       if (compact_enc == kEncodingIntSet)
@@ -189,13 +177,13 @@ uint8_t RdbObjectType(const PrimeValue& pv) {
       break;
     case OBJ_ZSET:
       if (compact_enc == OBJ_ENCODING_LISTPACK)
-        return RDB_TYPE_ZSET_ZIPLIST;  // we save using the old ziplist encoding.
+        return RDB_TYPE_ZSET_LISTPACK;
       else if (compact_enc == OBJ_ENCODING_SKIPLIST)
         return RDB_TYPE_ZSET_2;
       break;
     case OBJ_HASH:
       if (compact_enc == kEncodingListPack)
-        return RDB_TYPE_HASH_ZIPLIST;
+        return RDB_TYPE_HASH_LISTPACK;
       else if (compact_enc == kEncodingStrMap2) {
         if (((StringMap*)pv.RObjPtr())->ExpirationUsed())
           return RDB_TYPE_HASH_WITH_EXPIRY;  // Incompatible with Redis
@@ -204,8 +192,7 @@ uint8_t RdbObjectType(const PrimeValue& pv) {
       }
       break;
     case OBJ_STREAM:
-      return absl::GetFlag(FLAGS_stream_rdb_encode_v2) ? RDB_TYPE_STREAM_LISTPACKS_3
-                                                       : RDB_TYPE_STREAM_LISTPACKS;
+      return RDB_TYPE_STREAM_LISTPACKS_3;
     case OBJ_MODULE:
       return RDB_TYPE_MODULE_2;
     case OBJ_JSON:
@@ -280,7 +267,10 @@ io::Result<uint8_t> RdbSerializer::SaveEntry(const PrimeKey& pk, const PrimeValu
   }
 
   DVLOG(3) << "Selecting " << dbid << " previous: " << last_entry_db_index_;
-  SelectDb(dbid);
+  auto ec = SelectDb(dbid);
+  if (ec) {
+    return make_unexpected(ec);
+  }
 
   /* Save the expire time */
   if (expire_ms > 0) {
@@ -362,20 +352,11 @@ error_code RdbSerializer::SaveObject(const PrimeValue& pv) {
 
 error_code RdbSerializer::SaveListObject(const PrimeValue& pv) {
   /* Save a list value */
-  size_t len = 0;
-  const quicklistNode* node = nullptr;
+  DCHECK_EQ(pv.Encoding(), kEncodingQL2);
+  QList* ql = reinterpret_cast<QList*>(pv.RObjPtr());
+  const quicklistNode* node = (const quicklistNode*)ql->Head();
+  size_t len = ql->node_count();
 
-  if (pv.Encoding() == OBJ_ENCODING_QUICKLIST) {
-    const quicklist* ql = reinterpret_cast<const quicklist*>(pv.RObjPtr());
-    node = ql->head;
-    DVLOG(2) << "Saving list of length " << ql->len;
-    len = ql->len;
-  } else {
-    DCHECK_EQ(pv.Encoding(), kEncodingQL2);
-    QList* ql = reinterpret_cast<QList*>(pv.RObjPtr());
-    node = (const quicklistNode*)ql->Head();  // We rely on common ABI for Q2 and Q1 nodes.
-    len = ql->node_count();
-  }
   RETURN_ON_ERR(SaveLen(len));
 
   while (node) {
@@ -383,7 +364,7 @@ error_code RdbSerializer::SaveListObject(const PrimeValue& pv) {
              << "/" << node->sz;
 
     // Use listpack encoding
-    SaveLen(node->container);
+    RETURN_ON_ERR(SaveLen(node->container));
     if (quicklistNodeIsCompressed(node)) {
       void* data;
       size_t compress_len = quicklistGetLzf(node, &data);
@@ -405,7 +386,11 @@ error_code RdbSerializer::SaveSetObject(const PrimeValue& obj) {
   if (obj.Encoding() == kEncodingStrMap2) {
     StringSet* set = (StringSet*)obj.RObjPtr();
 
-    RETURN_ON_ERR(SaveLen(set->SizeSlow()));
+    // We don't expire any data during serialization
+    set->set_time(0);
+
+    // due to we avoid expiring we can use UpperBoundSize() instead of SlowSize()
+    RETURN_ON_ERR(SaveLen(set->UpperBoundSize()));
     for (auto it = set->begin(); it != set->end();) {
       RETURN_ON_ERR(SaveString(string_view{*it, sdslen(*it)}));
       if (set->ExpirationUsed()) {
@@ -420,6 +405,7 @@ error_code RdbSerializer::SaveSetObject(const PrimeValue& obj) {
         flush_state = FlushState::kFlushEndEntry;
       FlushIfNeeded(flush_state);
     }
+    set->set_time(MemberTimeSeconds(GetCurrentTimeMs()));
   } else {
     CHECK_EQ(obj.Encoding(), kEncodingIntSet);
     intset* is = (intset*)obj.RObjPtr();
@@ -437,7 +423,11 @@ error_code RdbSerializer::SaveHSetObject(const PrimeValue& pv) {
   if (pv.Encoding() == kEncodingStrMap2) {
     StringMap* string_map = (StringMap*)pv.RObjPtr();
 
-    RETURN_ON_ERR(SaveLen(string_map->SizeSlow()));
+    // We don't expire any data during serialization
+    string_map->set_time(0);
+
+    // due to we avoid expiring we can use UpperBoundSize() instead of SlowSize()
+    RETURN_ON_ERR(SaveLen(string_map->UpperBoundSize()));
 
     for (auto it = string_map->begin(); it != string_map->end();) {
       const auto& [k, v] = *it;
@@ -455,11 +445,14 @@ error_code RdbSerializer::SaveHSetObject(const PrimeValue& pv) {
         flush_state = FlushState::kFlushEndEntry;
       FlushIfNeeded(flush_state);
     }
+
+    string_map->set_time(MemberTimeSeconds(GetCurrentTimeMs()));
   } else {
     CHECK_EQ(kEncodingListPack, pv.Encoding());
 
     uint8_t* lp = (uint8_t*)pv.RObjPtr();
-    RETURN_ON_ERR(SaveListPackAsZiplist(lp));
+    size_t lp_bytes = lpBytes(lp);
+    RETURN_ON_ERR(SaveString((uint8_t*)lp, lp_bytes));
   }
 
   return error_code{};
@@ -496,9 +489,11 @@ error_code RdbSerializer::SaveZSetObject(const PrimeValue& pv) {
       return true;
     });
   } else {
-    CHECK_EQ(pv.Encoding(), unsigned(OBJ_ENCODING_LISTPACK)) << "Unknown zset encoding";
+    CHECK_EQ(pv.Encoding(), unsigned(OBJ_ENCODING_LISTPACK));
     uint8_t* lp = (uint8_t*)robj_wrapper->inner_obj();
-    RETURN_ON_ERR(SaveListPackAsZiplist(lp));
+    size_t lp_bytes = lpBytes(lp);
+
+    RETURN_ON_ERR(SaveString((uint8_t*)lp, lp_bytes));
   }
 
   return error_code{};
@@ -663,36 +658,6 @@ error_code RdbSerializer::SaveBinaryDouble(double val) {
   absl::little_endian::Store64(buf, *src);
 
   return WriteRaw(Bytes{buf, sizeof(buf)});
-}
-
-error_code RdbSerializer::SaveListPackAsZiplist(uint8_t* lp) {
-  uint8_t* lpfield = lpFirst(lp);
-  int64_t entry_len;
-  uint8_t* entry;
-  uint8_t buf[32];
-  uint8_t* zl = ziplistNew();
-
-  while (lpfield) {
-    entry = lpGet(lpfield, &entry_len, buf);
-    zl = ziplistPush(zl, entry, entry_len, ZIPLIST_TAIL);
-    lpfield = lpNext(lp, lpfield);
-  }
-  size_t ziplen = ziplistBlobLen(zl);
-  error_code ec = SaveString(string_view{reinterpret_cast<char*>(zl), ziplen});
-  zfree(zl);
-
-  return ec;
-}
-
-error_code RdbSerializer::SavePlainNodeAsZiplist(const quicklistNode* node) {
-  uint8_t* zl = ziplistNew();
-  zl = ziplistPush(zl, node->entry, node->sz, ZIPLIST_TAIL);
-
-  size_t ziplen = ziplistBlobLen(zl);
-  error_code ec = SaveString(string_view{reinterpret_cast<char*>(zl), ziplen});
-  zfree(zl);
-
-  return ec;
 }
 
 error_code RdbSerializer::SaveStreamPEL(rax* pel, bool nacks) {
@@ -910,7 +875,7 @@ size_t SerializerBase::SerializedLen() const {
 io::Bytes SerializerBase::PrepareFlush(SerializerBase::FlushState flush_state) {
   size_t sz = mem_buf_.InputLen();
   if (sz == 0)
-    return mem_buf_.InputBuffer();
+    return {};
 
   bool is_last_chunk = flush_state == FlushState::kFlushEndEntry;
   VLOG(2) << "PrepareFlush:" << is_last_chunk << " " << number_of_chunks_;
@@ -1367,18 +1332,30 @@ RdbSaver::GlobalData RdbSaver::GetGlobalData(const Service* service) {
       script_bodies.push_back(std::move(data.body));
   }
 
-  {
-    shard_set->Await(0, [&] {
-      auto* indices = EngineShard::tlocal()->search_indices();
-      for (auto index_name : indices->GetIndexNames()) {
+  atomic<size_t> table_mem{0};
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    if (shard->shard_id() == 0) {
+      auto* indices = shard->search_indices();
+      for (const auto& index_name : indices->GetIndexNames()) {
         auto index_info = indices->GetIndex(index_name)->GetInfo();
         search_indices.emplace_back(
             absl::StrCat(index_name, " ", index_info.BuildRestoreCommand()));
       }
-    });
-  }
+    }
+    auto& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    size_t shard_table_mem = 0;
+    for (size_t db_id = 0; db_id < db_slice.db_array_size(); ++db_id) {
+      auto* db_table = db_slice.GetDBTable(db_id);
 
-  return RdbSaver::GlobalData{std::move(script_bodies), std::move(search_indices)};
+      if (db_table) {
+        shard_table_mem += db_table->table_memory();
+      }
+    }
+    table_mem.fetch_add(shard_table_mem, memory_order_relaxed);
+  });
+
+  return RdbSaver::GlobalData{std::move(script_bodies), std::move(search_indices),
+                              table_mem.load(memory_order_relaxed)};
 }
 
 void RdbSaver::Impl::FillFreqMap(RdbTypeFreqMap* dest) const {
@@ -1397,7 +1374,8 @@ unique_ptr<SliceSnapshot>& RdbSaver::Impl::GetSnapshot(EngineShard* shard) {
   return shard_snapshots_[sid];
 }
 
-RdbSaver::RdbSaver(::io::Sink* sink, SaveMode save_mode, bool align_writes) {
+RdbSaver::RdbSaver(::io::Sink* sink, SaveMode save_mode, bool align_writes, std::string snapshot_id)
+    : snapshot_id_(std::move(snapshot_id)) {
   CHECK_NOTNULL(sink);
   CompressionMode compression_mode = GetDefaultCompressionMode();
   int producer_count = 0;
@@ -1463,7 +1441,7 @@ error_code RdbSaver::SaveHeader(const GlobalData& glob_state) {
   CHECK_EQ(9u, sz);
 
   RETURN_ON_ERR(impl_->serializer()->WriteRaw(Bytes{reinterpret_cast<uint8_t*>(magic), sz}));
-  RETURN_ON_ERR(SaveAux(std::move(glob_state)));
+  RETURN_ON_ERR(SaveAux(glob_state));  // Should be first after magic
   RETURN_ON_ERR(impl_->FlushSerializer());
   return error_code{};
 }
@@ -1493,9 +1471,10 @@ void RdbSaver::FillFreqMap(RdbTypeFreqMap* freq_map) {
 }
 
 error_code RdbSaver::SaveAux(const GlobalData& glob_state) {
-  static_assert(sizeof(void*) == 8, "");
-
-  error_code ec;
+  // Should be first
+  if (!snapshot_id_.empty()) {
+    RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("snapshot-id", snapshot_id_));
+  }
 
   /* Add a few fields about the state when the RDB was created. */
   RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("redis-ver", REDIS_VERSION));
@@ -1521,6 +1500,14 @@ error_code RdbSaver::SaveAux(const GlobalData& glob_state) {
     DCHECK(save_mode_ != SaveMode::SINGLE_SHARD || glob_state.search_indices.empty());
     for (const string& s : glob_state.search_indices)
       RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("search-index", s));
+    if (save_mode_ == SaveMode::SINGLE_SHARD_WITH_SUMMARY || save_mode_ == SaveMode::SUMMARY) {
+      // We save the shard id in the summary file, so that we can restore it later.
+      RETURN_ON_ERR(SaveAuxFieldStrInt("shard-count", shard_set->size()));
+      RETURN_ON_ERR(SaveAuxFieldStrInt("table-mem", glob_state.table_used_memory));
+    }
+    if (EngineShard* shard = EngineShard::tlocal(); shard) {
+      RETURN_ON_ERR(SaveAuxFieldStrInt("shard-id", shard->shard_id()));
+    }
   }
 
   // TODO: "repl-stream-db", "repl-id", "repl-offset"

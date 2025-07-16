@@ -7,6 +7,7 @@
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <absl/types/span.h>
+#include <hdr/hdr_histogram.h>
 
 #include <functional>
 #include <optional>
@@ -71,9 +72,8 @@ static_assert(!IsEvalKind(""));
 
 };  // namespace CO
 
-// Per thread vector of command stats. Each entry is:
-// command invocation string -> {cmd_calls, cmd_latency_agg in usec}.
-using CmdCallStats = absl::flat_hash_map<std::string, std::pair<uint64_t, uint64_t>>;
+// Per thread vector of command stats. Each entry is {cmd_calls, cmd_latency_agg in usec}.
+using CmdCallStats = std::pair<uint64_t, uint64_t>;
 
 struct CommandContext {
   CommandContext(Transaction* _tx, facade::SinkReplyBuilder* _rb, ConnectionContext* cntx)
@@ -85,14 +85,43 @@ struct CommandContext {
   ConnectionContext* conn_cntx;
 };
 
+// TODO: move it to helio
+// Makes sure that the POD T that is passed to the constructor is reset to default state
+template <typename T> class MoveOnly {
+ public:
+  MoveOnly() = default;
+
+  MoveOnly(const MoveOnly&) = delete;
+  MoveOnly& operator=(const MoveOnly&) = delete;
+
+  MoveOnly(MoveOnly&& t) noexcept : value_(std::move(t.value_)) {
+    t.value_ = T{};  // Reset the passed value to default state
+  }
+
+  MoveOnly& operator=(const T& t) noexcept {
+    value_ = t;
+    return *this;
+  }
+
+  operator const T&() const {  // NOLINT
+    return value_;
+  }
+
+ private:
+  T value_;
+};
+
 class CommandId : public facade::CommandId {
  public:
   // NOTICE: name must be a literal string, otherwise metrics break! (see cmd_stats_map in
   // server_state.h)
   CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first_key, int8_t last_key,
             std::optional<uint32_t> acl_categories = std::nullopt);
+  CommandId(CommandId&& o) = default;
 
-  CommandId(CommandId&&) = default;
+  ~CommandId();
+
+  [[nodiscard]] CommandId Clone(std::string_view name) const;
 
   void Init(unsigned thread_count) {
     command_stats_ = std::make_unique<CmdCallStats[]>(thread_count);
@@ -103,10 +132,8 @@ class CommandId : public facade::CommandId {
   using ArgValidator = fu2::function_base<true, true, fu2::capacity_default, false, false,
                                           std::optional<facade::ErrorReply>(CmdArgList) const>;
 
-  // Invokes the command handler. Returns the invoke time in usec. The invoked_by parameter is set
-  // to the string passed in by user, if available. If not set, defaults to command name.
-  uint64_t Invoke(CmdArgList args, const CommandContext& cmd_cntx,
-                  std::string_view orig_cmd_name) const;
+  // Returns the invoke time in usec.
+  uint64_t Invoke(CmdArgList args, const CommandContext& cmd_cntx) const;
 
   // Returns error if validation failed, otherwise nullopt
   std::optional<facade::ErrorReply> Validate(CmdArgList tail_args) const;
@@ -143,9 +170,7 @@ class CommandId : public facade::CommandId {
     return (last_key_ != first_key_) || (opt_mask_ & CO::VARIADIC_KEYS);
   }
 
-  void ResetStats(unsigned thread_index) {
-    command_stats_[thread_index].clear();
-  }
+  void ResetStats(unsigned thread_index);
 
   CmdCallStats GetStats(unsigned thread_index) const {
     return command_stats_[thread_index];
@@ -156,11 +181,20 @@ class CommandId : public facade::CommandId {
       acl_categories_ |= mask;
   }
 
+  bool IsAlias() const {
+    return is_alias_;
+  }
+
+  hdr_histogram* LatencyHist() const;
+
  private:
+  // The following fields must copy manually in the move constructor.
   bool implicit_acl_;
+  bool is_alias_{false};
   std::unique_ptr<CmdCallStats[]> command_stats_;
   Handler3 handler_;
   ArgValidator validator_;
+  MoveOnly<hdr_histogram*> latency_histogram_;  // Histogram for command latency in usec
 };
 
 class CommandRegistry {
@@ -172,16 +206,8 @@ class CommandRegistry {
   CommandRegistry& operator<<(CommandId cmd);
 
   const CommandId* Find(std::string_view cmd) const {
-    if (const auto it = cmd_map_.find(cmd); it != cmd_map_.end()) {
-      return &it->second;
-    }
-
-    if (const auto it = cmd_aliases_.find(cmd); it != cmd_aliases_.end()) {
-      if (const auto alias_lookup = cmd_map_.find(it->second); alias_lookup != cmd_map_.end()) {
-        return &alias_lookup->second;
-      }
-    }
-    return nullptr;
+    auto it = cmd_map_.find(cmd);
+    return it == cmd_map_.end() ? nullptr : &it->second;
   }
 
   CommandId* Find(std::string_view cmd) {
@@ -203,17 +229,13 @@ class CommandRegistry {
     }
   }
 
-  void MergeCallStats(
-      unsigned thread_index,
-      std::function<void(std::string_view, const CmdCallStats::mapped_type&)> cb) const {
-    for (const auto& [_, cmd_id] : cmd_map_) {
-      for (const auto& [cmd_name, call_stats] : cmd_id.GetStats(thread_index)) {
-        if (call_stats.first == 0) {
-          continue;
-        }
-
-        cb(cmd_name, call_stats);
-      }
+  void MergeCallStats(unsigned thread_index,
+                      std::function<void(std::string_view, const CmdCallStats&)> cb) const {
+    for (const auto& k_v : cmd_map_) {
+      auto src = k_v.second.GetStats(thread_index);
+      if (src.first == 0)
+        continue;
+      cb(k_v.second.name(), src);
     }
   }
 
@@ -227,16 +249,11 @@ class CommandRegistry {
   std::pair<const CommandId*, facade::ArgSlice> FindExtended(std::string_view cmd,
                                                              facade::ArgSlice tail_args) const;
 
-  bool IsAlias(std::string_view cmd) const;
+  absl::flat_hash_map<std::string, hdr_histogram*> LatencyMap() const;
 
  private:
   absl::flat_hash_map<std::string, CommandId> cmd_map_;
   absl::flat_hash_map<std::string, std::string> cmd_rename_map_;
-  // Stores a mapping from alias to original command. During the find operation, the first lookup is
-  // done in the cmd_map_, then in the alias map. This results in two lookups but only for commands
-  // which are not in original map, ie either typos or aliases. While it would be faster, we cannot
-  // store iterators into cmd_map_ here as they may be invalidated on rehashing.
-  absl::flat_hash_map<std::string, std::string> cmd_aliases_;
   absl::flat_hash_set<std::string> restricted_cmds_;
   absl::flat_hash_set<std::string> oomdeny_cmds_;
 

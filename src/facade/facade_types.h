@@ -63,7 +63,8 @@ struct ArgRange {
   ArgRange(ArgRange& range) : ArgRange((const ArgRange&)range) {
   }
 
-  template <typename T> ArgRange(T&& span) : span(std::forward<T>(span)) {
+  template <typename T, std::enable_if_t<!std::is_same_v<ArgRange, T>, bool> = true>
+  ArgRange(T&& span) : span(std::forward<T>(span)) {  // NOLINT google-explicit-constructor)
   }
 
   size_t Size() const {
@@ -111,9 +112,16 @@ struct ConnectionStats {
   uint64_t num_migrations = 0;
   uint64_t num_recv_provided_calls = 0;
 
+  // Number of times the tls connection was closed by the time we started reading from it.
+  uint64_t tls_accept_disconnects = 0;  // number of TLS socket disconnects during the handshake
+                                        //
+  uint64_t handshakes_started = 0;
+  uint64_t handshakes_completed = 0;
+
   // Number of events when the pipeline queue was over the limit and was throttled.
   uint64_t pipeline_throttle_count = 0;
-
+  uint64_t pipeline_dispatch_calls = 0;
+  uint64_t pipeline_dispatch_commands = 0;
   ConnectionStats& operator+=(const ConnectionStats& o);
 };
 
@@ -139,7 +147,13 @@ struct ReplyStats {
   absl::flat_hash_map<std::string, uint64_t> err_count;
   size_t script_error_count = 0;
 
+  // This variable can be updated directly from shard threads when they allocate memory for replies.
+  std::atomic<size_t> squashing_current_reply_size{0};
+
+  ReplyStats() = default;
+  ReplyStats(ReplyStats&& other) noexcept;
   ReplyStats& operator+=(const ReplyStats& other);
+  ReplyStats& operator=(const ReplyStats& other);
 };
 
 struct FacadeStats {
@@ -163,7 +177,9 @@ struct ErrorReply {
                       std::string_view kind = {})  // to resolve ambiguity of constructors above
       : message{std::string_view{msg}}, kind{kind} {
   }
-  ErrorReply(OpStatus status) : message{}, kind{}, status{status} {
+
+  ErrorReply(OpStatus status)  // NOLINT google-explicit-constructor)
+      : status{status} {
   }
 
   std::string_view ToSv() const {
@@ -186,6 +202,21 @@ constexpr inline unsigned long long operator""_KB(unsigned long long x) {
 extern __thread FacadeStats* tl_facade_stats;
 
 void ResetStats();
+
+// TODO: move this flag to helio (base/flags.h)
+struct MemoryBytesFlag {
+  size_t value = 0;
+
+  MemoryBytesFlag(size_t s = 0) : value(s) {  // NOLINT
+  }
+
+  operator size_t() const {  // NOLINT
+    return value;
+  }
+};
+
+bool AbslParseFlag(std::string_view in, MemoryBytesFlag* flag, std::string* err);
+std::string AbslUnparseFlag(const MemoryBytesFlag& flag);
 
 // Constants for socket bufring.
 constexpr uint16_t kRecvSockGid = 0;

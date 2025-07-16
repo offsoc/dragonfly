@@ -1,4 +1,3 @@
-
 // Copyright 2023, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
@@ -108,8 +107,6 @@ constexpr size_t kFiberDefaultStackSize = 32_KB - 16;
 constexpr size_t kFiberDefaultStackSize = 40_KB - 16;
 #endif
 
-using util::http::TlsClient;
-
 enum class TermColor { kDefault, kRed, kGreen, kYellow };
 // Returns the ANSI color code for the given color. TermColor::kDefault is
 // an invalid input.
@@ -170,7 +167,7 @@ string NormalizePaths(std::string_view path) {
 }
 
 template <typename... Args> unique_ptr<Listener> MakeListener(Args&&... args) {
-  auto res = make_unique<Listener>(forward<Args>(args)...);
+  auto res = make_unique<Listener>(std::forward<Args>(args)...);
   res->SetConnFiberStackSize(kFiberDefaultStackSize);
   return res;
 }
@@ -299,7 +296,11 @@ void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
 
   if (mc_port > 0 && !tcp_disabled) {
     auto listener = MakeListener(Protocol::MEMCACHE, &service);
-    acceptor->AddListener(mc_port, listener.get());
+    error_code ec = acceptor->AddListener(nullptr, mc_port, listener.get());
+    if (ec) {
+      LOG(ERROR) << "Could not open memcached port " << mc_port << ", error: " << ec.message();
+      exit(1);
+    }
     listeners.push_back(listener.release());
   }
 
@@ -651,30 +652,36 @@ void sigill_hdlr(int signo) {
 }
 
 void PrintBasicUsageInfo() {
-  std::cout << "                   .--::--.                   \n";
-  std::cout << "   :+*=:          =@@@@@@@@=          :+*+:   \n";
-  std::cout << "  %@@@@@@%*=.     =@@@@@@@@-     .=*%@@@@@@#  \n";
-  std::cout << "  @@@@@@@@@@@@#+-. .%@@@@#. .-+#@@@@@@@@@@@%  \n";
-  std::cout << "  -@@@@@@@@@@@@@@@@*:#@@#:*@@@@@@@@@@@@@@@@-  \n";
-  std::cout << "    :+*********####-%@%%@%-####********++.    \n";
-  std::cout << "   .%@@@@@@@@@@@@@%:@@@@@@:@@@@@@@@@@@@@@%    \n";
-  std::cout << "   .@@@@@@@@%*+-:   =@@@@=  .:-+*%@@@@@@@%.   \n";
-  std::cout << "     =*+-:           ###*          .:-+*=     \n";
-  std::cout << "                     %@@%                     \n";
-  std::cout << "                     *@@*                     \n";
-  std::cout << "                     +@@=                     \n";
-  std::cout << "                     :##:                     \n";
-  std::cout << "                     :@@:                     \n";
-  std::cout << "                      @@                      \n";
-  std::cout << "                      ..                      \n";
-  std::cout << "* Logs will be written to the first available of the following paths:\n";
+  std::string output =
+      "                   .--::--.                   \n"
+      "   :+*=:          =@@@@@@@@=          :+*+:   \n"
+      "  %@@@@@@%*=.     =@@@@@@@@-     .=*%@@@@@@#  \n"
+      "  @@@@@@@@@@@@#+-. .%@@@@#. .-+#@@@@@@@@@@@%  \n"
+      "  -@@@@@@@@@@@@@@@@*:#@@#:*@@@@@@@@@@@@@@@@-  \n"
+      "    :+*********####-%@%%@%-####********++.    \n"
+      "   .%@@@@@@@@@@@@@%:@@@@@@:@@@@@@@@@@@@@@%    \n"
+      "   .@@@@@@@@%*+-:   =@@@@=  .:-+*%@@@@@@@%.   \n"
+      "     =*+-:           ###*          .:-+*=     \n"
+      "                     %@@%                     \n"
+      "                     *@@*                     \n"
+      "                     +@@=                     \n"
+      "                     :##:                     \n"
+      "                     :@@:                     \n"
+      "                      @@                      \n"
+      "                      ..                      \n"
+      "* Logs will be written to the first available of the following paths:\n";
+
   for (const auto& dir : google::GetLoggingDirectories()) {
     const string_view maybe_slash = absl::EndsWith(dir, "/") ? "" : "/";
-    std::cout << dir << maybe_slash << "dragonfly.*\n";
+    absl::StrAppend(&output, dir, maybe_slash, "dragonfly.*\n");
   }
-  std::cout << "* For the available flags type dragonfly [--help | --helpfull]\n";
-  std::cout << "* Documentation can be found at: https://www.dragonflydb.io/docs";
-  std::cout << endl;
+
+  absl::StrAppend(&output,
+                  "* For the available flags type dragonfly [--help | --helpfull]\n"
+                  "* Documentation can be found at: https://www.dragonflydb.io/docs\n");
+
+  std::cout << output;
+  std::cout.flush();
 }
 
 void ParseFlagsFromEnv() {
@@ -763,8 +770,6 @@ Usage: dragonfly [FLAGS]
     LOG(INFO) << "listening on unix socket " << usock << ".";
   }
 
-  mi_stats_reset();
-
   if (GetFlag(FLAGS_dbnum) > dfly::kMaxDbId) {
     LOG(ERROR) << "dbnum is too big. Exiting...";
     return 1;
@@ -814,9 +819,13 @@ Usage: dragonfly [FLAGS]
 
   // Initialize mi_malloc options
   // export MIMALLOC_VERBOSE=1 to see the options before the override.
-  mi_option_enable(mi_option_show_errors);
-  mi_option_set(mi_option_max_warnings, 0);
-  mi_option_enable(mi_option_purge_decommits);
+  // _default functions override the default options vaues but if the options were set
+  // via the environment variables, they will not be overridden.
+  mi_option_set_enabled_default(mi_option_show_errors, true);
+  mi_option_set_default(mi_option_purge_delay, 0);
+
+  // To see the options after the override, use:
+  // mi_options_print();
 
   fb2::SetDefaultStackResource(&fb2::std_malloc_resource, kFiberDefaultStackSize);
 

@@ -19,6 +19,7 @@
 using namespace testing;
 
 ABSL_DECLARE_FLAG(std::vector<std::string>, rename_command);
+ABSL_DECLARE_FLAG(std::vector<std::string>, command_alias);
 
 namespace dfly {
 
@@ -29,6 +30,7 @@ class AclFamilyTest : public BaseFamilyTest {
 class AclFamilyTestRename : public BaseFamilyTest {
   void SetUp() override {
     absl::SetFlag(&FLAGS_rename_command, {"ACL=ROCKS"});
+    absl::SetFlag(&FLAGS_command_alias, {"___SET=SET"});
     ResetService();
   }
 };
@@ -316,7 +318,7 @@ TEST_F(AclFamilyTest, TestUsers) {
 TEST_F(AclFamilyTest, TestCat) {
   TestInitAclFam();
   auto resp = Run({"ACL", "CAT", "nonsense"});
-  EXPECT_THAT(resp, ErrArg("ERR Unkown category: NONSENSE"));
+  EXPECT_THAT(resp, ErrArg("ERR Unknown category: NONSENSE"));
 
   resp = Run({"ACL", "CAT"});
   EXPECT_GE(resp.GetVec().size(), 24u);
@@ -327,7 +329,7 @@ TEST_F(AclFamilyTest, TestCat) {
               UnorderedElementsAre("GETSET", "GETRANGE", "INCRBYFLOAT", "GETDEL", "DECRBY",
                                    "PREPEND", "SETEX", "MSET", "SET", "PSETEX", "SUBSTR", "DECR",
                                    "STRLEN", "INCR", "INCRBY", "MGET", "GET", "SETNX", "GETEX",
-                                   "APPEND", "MSETNX", "SETRANGE"));
+                                   "APPEND", "MSETNX", "SETRANGE", "GAT"));
 }
 
 TEST_F(AclFamilyTest, TestGetUser) {
@@ -536,6 +538,32 @@ TEST_F(AclFamilyTest, TestPubSub) {
   vec = resp.GetVec();
   EXPECT_THAT(vec[8], "channels");
   EXPECT_THAT(vec[9], "resetchannels &foo");
+}
+
+TEST_F(AclFamilyTest, TestAlias) {
+  auto resp = Run({"ACL", "SETUSER", "luke", "+___SET"});
+  EXPECT_THAT(resp, ErrArg("ERR Unrecognized parameter +___SET"));
+
+  resp = Run({"ACL", "SETUSER", "leia", "-___SET"});
+  EXPECT_THAT(resp, ErrArg("ERR Unrecognized parameter -___SET"));
+
+  resp = Run({"ACL", "SETUSER", "anakin", "+SET"});
+  EXPECT_EQ(resp, "OK");
+
+  resp = Run({"ACL", "SETUSER", "jarjar", "allcommands"});
+  EXPECT_EQ(resp, "OK");
+
+  resp = Run({"ACL", "DRYRUN", "jarjar", "___SET"});
+  EXPECT_THAT(resp, ErrArg("ERR Command '___SET' not found"));
+  EXPECT_EQ(Run({"ACL", "DRYRUN", "jarjar", "SET"}), "OK");
+}
+
+TEST_F(AclFamilyTest, TestAclLogUB) {
+  auto resp = Run({"ACL", "LOG"});
+  EXPECT_TRUE(resp.GetVec().empty());
+
+  resp = Run({"ACL", "LOG", "2", "RESET"});
+  EXPECT_THAT(resp, ErrArg("ERR index out of range"));
 }
 
 }  // namespace dfly

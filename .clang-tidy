@@ -8,10 +8,13 @@ Checks: >
   -bugprone-easily-swappable-parameters,
   -bugprone-branch-clone,
   -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-too-small-loop-variable,
+  -bugprone-reserved-identifier,
   boost-use-to-string,
   performance*,
-  cert*,
   -cert-err58-cpp,
+  -cert-dcl58-cpp,  # Ignore std changes
+  -cert-dcl51-cpp,  # bugprone-reserved-identifier
   # Doesn't work with abseil flags
   clang-analyzer*,
   google-*,
@@ -55,7 +58,7 @@ Checks: >
   readability-duplicate-include,
   readability-function-size,
   readability-identifier-naming,
-  readability-inconsistent-declaration-parameter-name,
+  -readability-inconsistent-declaration-parameter-name,
   readability-make-member-function-const,
   readability-misplaced-array-index,
   readability-named-parameter,
@@ -81,4 +84,9 @@ Checks: >
 # modernize-use-nullptr,
 # modernize-use-equals-default,
 # readability-qualified-auto,
-cppcoreguidelines-narrowing-conversions.WarnOnIntegerNarrowingConversion: 'false'
+
+CheckOptions:
+  - key: bugprone-narrowing-conversions.WarnOnIntegerNarrowingConversion
+    value: false
+  - key: bugprone-narrowing-conversions.WarnOnEquivalentBitWidth
+    value: false

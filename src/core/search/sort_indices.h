@@ -36,10 +36,13 @@ template <typename T> struct SimpleValueSortIndex : public BaseSortIndex {
   SimpleValueSortIndex(PMR_NS::memory_resource* mr);
 
   SortableValue Lookup(DocId doc) const override;
-  std::vector<ResultScore> Sort(std::vector<DocId>* ids, size_t limit, bool desc) const override;
+  std::vector<SortableValue> Sort(std::vector<DocId>* ids, size_t limit, bool desc) const override;
 
   bool Add(DocId id, const DocumentAccessor& doc, std::string_view field) override;
   void Remove(DocId id, const DocumentAccessor& doc, std::string_view field) override;
+
+  // Override GetAllResults to return all documents with non-null values
+  std::vector<DocId> GetAllDocsWithNonNullValues() const override;
 
  protected:
   virtual ParsedSortValue Get(const DocumentAccessor& doc, std::string_view field_value) = 0;
@@ -48,7 +51,7 @@ template <typename T> struct SimpleValueSortIndex : public BaseSortIndex {
 
  private:
   PMR_NS::vector<T> values_;
-  absl::flat_hash_set<DocId> null_values_;
+  UniqueDocsList<PMR_NS::polymorphic_allocator<DocId>> null_values_;
 };
 
 struct NumericSortIndex : public SimpleValueSortIndex<double> {

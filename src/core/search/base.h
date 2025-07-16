@@ -13,6 +13,7 @@
 #include <string_view>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
 #include "base/pmr/memory_resource.h"
 #include "core/string_map.h"
 
@@ -37,31 +38,7 @@ struct QueryParams {
   absl::flat_hash_map<std::string, std::string> params;
 };
 
-struct SortOption {
-  std::string field;
-  bool descending = false;
-};
-
-// Comparable string stored as char[]. Used to reduce size of std::variant with strings.
-struct WrappedStrPtr {
-  // Intentionally implicit and const std::string& for use in templates
-  WrappedStrPtr(const PMR_NS::string& s);
-  WrappedStrPtr(const std::string& s);
-  bool operator<(const WrappedStrPtr& other) const;
-  bool operator>=(const WrappedStrPtr& other) const;
-
-  operator std::string_view() const;
-
- private:
-  std::unique_ptr<char[]> ptr;
-};
-
-// Score produced either by KNN (float) or SORT (double / wrapped str)
-using ResultScore = std::variant<std::monostate, float, double, WrappedStrPtr>;
-
 // Values are either sortable as doubles or strings, or not sortable at all.
-// Contrary to ResultScore it doesn't include KNN results and is not optimized for smaller struct
-// size.
 using SortableValue = std::variant<std::monostate, double, std::string>;
 
 // Interface for accessing document values with different data structures underneath.
@@ -85,6 +62,11 @@ struct DocumentAccessor {
   virtual std::optional<StringList> GetTags(std::string_view active_field) const = 0;
 };
 
+// Represents a set of document IDs, used for merging results of inverse indices.
+template <typename Allocator = std::allocator<DocId>>
+using UniqueDocsList = absl::flat_hash_set<DocId, absl::DefaultHashContainerHash<DocId>,
+                                           absl::DefaultHashContainerEq<DocId>, Allocator>;
+
 // Base class for type-specific indices.
 //
 // Queries should be done directly on subclasses with their distinc
@@ -95,12 +77,17 @@ struct BaseIndex {
   // Returns true if the document was added / indexed
   virtual bool Add(DocId id, const DocumentAccessor& doc, std::string_view field) = 0;
   virtual void Remove(DocId id, const DocumentAccessor& doc, std::string_view field) = 0;
+
+  // Returns documents that have non-null values for this field (used for @field:* queries)
+  // Result must be sorted
+  virtual std::vector<DocId> GetAllDocsWithNonNullValues() const = 0;
 };
 
 // Base class for type-specific sorting indices.
 struct BaseSortIndex : BaseIndex {
   virtual SortableValue Lookup(DocId doc) const = 0;
-  virtual std::vector<ResultScore> Sort(std::vector<DocId>* ids, size_t limit, bool desc) const = 0;
+  virtual std::vector<SortableValue> Sort(std::vector<DocId>* ids, size_t limit,
+                                          bool desc) const = 0;
 };
 
 /* Used for converting field values to double. Returns std::nullopt if the conversion fails */

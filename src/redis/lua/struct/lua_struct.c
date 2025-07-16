@@ -96,7 +96,6 @@ static int getnum (lua_State *L, const char **fmt, int df) {
   }
 }
 
-
 #define defaultoptions(h)	((h)->endian = native.endian, (h)->align = 1)
 
 
@@ -110,7 +109,7 @@ static size_t optsize (lua_State *L, char opt, const char **fmt) {
     case 'f':  return sizeof(float);
     case 'd':  return sizeof(double);
     case 'x': return 1;
-    case 'c': return getnum(L, fmt, 1);
+    case 'c': return  getnum(L, fmt, 1);
     case 'i': case 'I': {
       int sz = getnum(L, fmt, sizeof(int));
       if (sz > MAXINTSIZE)

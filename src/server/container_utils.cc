@@ -19,7 +19,6 @@ extern "C" {
 #include "redis/listpack.h"
 #include "redis/redis_aux.h"
 #include "redis/util.h"
-#include "redis/zset.h"
 }
 
 namespace dfly::container_utils {
@@ -139,40 +138,9 @@ OpResult<ShardFFResult> FindFirstNonEmpty(Transaction* trans, int req_obj_type) 
 
 using namespace std;
 
-quicklistEntry QLEntry() {
-  quicklistEntry res{.quicklist = NULL,
-                     .node = NULL,
-                     .zi = NULL,
-                     .value = NULL,
-                     .longval = 0,
-                     .sz = 0,
-                     .offset = 0};
-  return res;
-}
-
 bool IterateList(const PrimeValue& pv, const IterateFunc& func, long start, long end) {
   bool success = true;
 
-  if (pv.Encoding() == OBJ_ENCODING_QUICKLIST) {
-    quicklist* ql = static_cast<quicklist*>(pv.RObjPtr());
-    long llen = quicklistCount(ql);
-    if (end < 0 || end >= llen)
-      end = llen - 1;
-
-    quicklistIter* qiter = quicklistGetIteratorAtIdx(ql, AL_START_HEAD, start);
-    quicklistEntry entry = QLEntry();
-    long lrange = end - start + 1;
-
-    while (success && quicklistNext(qiter, &entry) && lrange-- > 0) {
-      if (entry.value) {
-        success = func(ContainerEntry{reinterpret_cast<char*>(entry.value), entry.sz});
-      } else {
-        success = func(ContainerEntry{entry.longval});
-      }
-    }
-    quicklistReleaseIterator(qiter);
-    return success;
-  }
   DCHECK_EQ(pv.Encoding(), kEncodingQL2);
   QList* ql = static_cast<QList*>(pv.RObjPtr());
 
@@ -217,6 +185,9 @@ bool IterateSortedSet(const detail::RobjWrapper* robj_wrapper, const IterateSort
   if (end < 0 || unsigned(end) >= llen)
     end = llen - 1;
 
+  if (start > end || unsigned(start) >= llen)
+    return true;
+
   unsigned rangelen = unsigned(end - start) + 1;
 
   if (robj_wrapper->encoding() == OBJ_ENCODING_LISTPACK) {
@@ -243,7 +214,7 @@ bool IterateSortedSet(const detail::RobjWrapper* robj_wrapper, const IterateSort
 
       // don't bother to extract the score if it's gonna be ignored.
       if (use_score)
-        score = zzlGetScore(sptr);
+        score = detail::ZzlGetScore(sptr);
 
       if (vstr == NULL) {
         success = func(ContainerEntry{vlong}, score);
@@ -252,9 +223,9 @@ bool IterateSortedSet(const detail::RobjWrapper* robj_wrapper, const IterateSort
       }
 
       if (reverse) {
-        zzlPrev(zl, &eptr, &sptr);
+        detail::ZzlPrev(zl, &eptr, &sptr);
       } else {
-        zzlNext(zl, &eptr, &sptr);
+        detail::ZzlNext(zl, &eptr, &sptr);
       };
     }
     return success;

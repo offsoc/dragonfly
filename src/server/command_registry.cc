@@ -22,14 +22,18 @@ using namespace std;
 ABSL_FLAG(vector<string>, rename_command, {},
           "Change the name of commands, format is: <cmd1_name>=<cmd1_new_name>, "
           "<cmd2_name>=<cmd2_new_name>");
-ABSL_FLAG(vector<string>, command_alias, {},
-          "Add an alias for given commands, format is: <alias>=<original>, "
-          "<alias>=<original>");
 ABSL_FLAG(vector<string>, restricted_commands, {},
           "Commands restricted to connections on the admin port");
 
 ABSL_FLAG(vector<string>, oom_deny_commands, {},
           "Additinal commands that will be marked as denyoom");
+
+ABSL_FLAG(vector<string>, command_alias, {},
+          "Add an alias for given command(s), format is: <alias>=<original>, <alias>=<original>. "
+          "Aliases must be set identically on replicas, if applicable");
+
+ABSL_FLAG(bool, latency_tracking, false, "If true, track latency for commands");
+
 namespace dfly {
 
 using namespace facade;
@@ -75,16 +79,17 @@ uint32_t ImplicitAclCategories(uint32_t mask) {
   return out;
 }
 
-absl::flat_hash_map<std::string, std::string> ParseCmdlineArgMap(
-    const absl::Flag<std::vector<std::string>>& flag, const bool allow_duplicates = false) {
+using CmdLineMapping = absl::flat_hash_map<std::string, std::string>;
+
+CmdLineMapping ParseCmdlineArgMap(const absl::Flag<std::vector<std::string>>& flag) {
   const auto& mappings = absl::GetFlag(flag);
-  absl::flat_hash_map<std::string, std::string> parsed_mappings;
+  CmdLineMapping parsed_mappings;
   parsed_mappings.reserve(mappings.size());
 
   for (const std::string& mapping : mappings) {
-    std::vector<std::string_view> kv = absl::StrSplit(mapping, '=');
+    absl::InlinedVector<std::string_view, 2> kv = absl::StrSplit(mapping, '=');
     if (kv.size() != 2) {
-      LOG(ERROR) << "Malformed command " << mapping << " for " << flag.Name()
+      LOG(ERROR) << "Malformed command '" << mapping << "' for " << flag.Name()
                  << ", expected key=value";
       exit(1);
     }
@@ -97,14 +102,30 @@ absl::flat_hash_map<std::string, std::string> ParseCmdlineArgMap(
       exit(1);
     }
 
-    const bool inserted = parsed_mappings.emplace(std::move(key), std::move(value)).second;
-    if (!allow_duplicates && !inserted) {
+    if (!parsed_mappings.emplace(std::move(key), std::move(value)).second) {
       LOG(ERROR) << "Duplicate insert to " << flag.Name() << " not allowed";
       exit(1);
     }
   }
   return parsed_mappings;
 }
+
+CmdLineMapping OriginalToAliasMap() {
+  CmdLineMapping original_to_alias;
+  CmdLineMapping alias_to_original = ParseCmdlineArgMap(FLAGS_command_alias);
+  original_to_alias.reserve(alias_to_original.size());
+  std::for_each(std::make_move_iterator(alias_to_original.begin()),
+                std::make_move_iterator(alias_to_original.end()),
+                [&original_to_alias](auto&& pair) {
+                  original_to_alias.emplace(std::move(pair.second), std::move(pair.first));
+                });
+
+  return original_to_alias;
+}
+
+constexpr int64_t kLatencyHistogramMinValue = 1;        // Minimum value in usec
+constexpr int64_t kLatencyHistogramMaxValue = 1000000;  // Maximum value in usec (1s)
+constexpr int32_t kLatencyHistogramPrecision = 2;
 
 }  // namespace
 
@@ -113,6 +134,32 @@ CommandId::CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first
     : facade::CommandId(name, ImplicitCategories(mask), arity, first_key, last_key,
                         acl_categories.value_or(ImplicitAclCategories(mask))) {
   implicit_acl_ = !acl_categories.has_value();
+  hdr_histogram* hist = nullptr;
+  hdr_init(kLatencyHistogramMinValue, kLatencyHistogramMaxValue, kLatencyHistogramPrecision, &hist);
+  latency_histogram_ = hist;
+}
+
+CommandId::~CommandId() {
+  // Aliases share the same latency histogram, so we only close it if this is not an alias.
+  if (latency_histogram_ && !is_alias_) {
+    hdr_close(latency_histogram_);
+  }
+}
+
+CommandId CommandId::Clone(const std::string_view name) const {
+  CommandId cloned =
+      CommandId{name.data(), opt_mask_, arity_, first_key_, last_key_, acl_categories_};
+  cloned.handler_ = handler_;
+  cloned.opt_mask_ = opt_mask_ | CO::HIDDEN;
+  cloned.acl_categories_ = acl_categories_;
+  cloned.implicit_acl_ = implicit_acl_;
+  cloned.is_alias_ = true;
+
+  // explicit sharing of the object since it's an alias we can do that.
+  // I am assuming that the source object lifetime is at least as of the cloned object.
+  hdr_close(cloned.latency_histogram_);  // Free the histogram in the cloned object.
+  cloned.latency_histogram_ = static_cast<hdr_histogram*>(latency_histogram_);
+  return cloned;
 }
 
 bool CommandId::IsTransactional() const {
@@ -130,20 +177,25 @@ bool CommandId::IsMultiTransactional() const {
   return CO::IsTransKind(name()) || CO::IsEvalKind(name());
 }
 
-uint64_t CommandId::Invoke(CmdArgList args, const CommandContext& cmd_cntx,
-                           std::string_view orig_cmd_name) const {
-  int64_t before = absl::GetCurrentTimeNanos();
+uint64_t CommandId::Invoke(CmdArgList args, const CommandContext& cmd_cntx) const {
+  uint64_t before = cmd_cntx.conn_cntx->conn_state.cmd_start_time_ns;
+  DCHECK_GT(before, 0u);
   handler_(args, cmd_cntx);
   int64_t after = absl::GetCurrentTimeNanos();
 
   ServerState* ss = ServerState::tlocal();  // Might have migrated thread, read after invocation
   int64_t execution_time_usec = (after - before) / 1000;
 
-  auto& ent = command_stats_[ss->thread_index()][orig_cmd_name];
+  auto& ent = command_stats_[ss->thread_index()];
 
   ++ent.first;
   ent.second += execution_time_usec;
-
+  static const bool is_latency_tracked = GetFlag(FLAGS_latency_tracking);
+  if (is_latency_tracked) {
+    if (hdr_histogram* cmd_histogram = latency_histogram_; cmd_histogram != nullptr) {
+      hdr_record_value(cmd_histogram, execution_time_usec);
+    }
+  }
   return execution_time_usec;
 }
 
@@ -167,9 +219,19 @@ optional<facade::ErrorReply> CommandId::Validate(CmdArgList tail_args) const {
   return nullopt;
 }
 
+void CommandId::ResetStats(unsigned thread_index) {
+  command_stats_[thread_index] = {0, 0};
+  if (hdr_histogram* h = latency_histogram_; h != nullptr) {
+    hdr_reset(h);
+  }
+}
+
+hdr_histogram* CommandId::LatencyHist() const {
+  return latency_histogram_;
+}
+
 CommandRegistry::CommandRegistry() {
   cmd_rename_map_ = ParseCmdlineArgMap(FLAGS_rename_command);
-  cmd_aliases_ = ParseCmdlineArgMap(FLAGS_command_alias, true);
 
   for (string name : GetFlag(FLAGS_restricted_commands)) {
     restricted_cmds_.emplace(AsciiStrToUpper(name));
@@ -181,9 +243,20 @@ CommandRegistry::CommandRegistry() {
 }
 
 void CommandRegistry::Init(unsigned int thread_count) {
+  const CmdLineMapping original_to_alias = OriginalToAliasMap();
+  absl::flat_hash_map<std::string, CommandId> alias_to_command_id;
+  alias_to_command_id.reserve(original_to_alias.size());
   for (auto& [_, cmd] : cmd_map_) {
     cmd.Init(thread_count);
+    if (auto it = original_to_alias.find(cmd.name()); it != original_to_alias.end()) {
+      auto alias_cmd = cmd.Clone(it->second);
+      alias_cmd.Init(thread_count);
+      alias_to_command_id.insert({it->second, std::move(alias_cmd)});
+    }
   }
+  std::copy(std::make_move_iterator(alias_to_command_id.begin()),
+            std::make_move_iterator(alias_to_command_id.end()),
+            std::inserter(cmd_map_, cmd_map_.end()));
 }
 
 CommandRegistry& CommandRegistry::operator<<(CommandId cmd) {
@@ -212,7 +285,7 @@ CommandRegistry& CommandRegistry::operator<<(CommandId cmd) {
 
   if (!is_sub_command || absl::StartsWith(cmd.name(), "ACL")) {
     cmd.SetBitIndex(1ULL << bit_index_);
-    family_of_commands_.back().push_back(std::string(k));
+    family_of_commands_.back().emplace_back(k);
     ++bit_index_;
   } else {
     DCHECK(absl::StartsWith(k, family_of_commands_.back().back()));
@@ -266,8 +339,13 @@ std::pair<const CommandId*, ArgSlice> CommandRegistry::FindExtended(string_view 
   return {res, tail_args};
 }
 
-bool CommandRegistry::IsAlias(std::string_view cmd) const {
-  return cmd_aliases_.contains(cmd);
+absl::flat_hash_map<std::string, hdr_histogram*> CommandRegistry::LatencyMap() const {
+  absl::flat_hash_map<std::string, hdr_histogram*> cmd_latencies;
+  cmd_latencies.reserve(cmd_map_.size());
+  for (const auto& [cmd_name, cmd] : cmd_map_) {
+    cmd_latencies.insert({absl::AsciiStrToLower(cmd_name), cmd.LatencyHist()});
+  }
+  return cmd_latencies;
 }
 
 namespace CO {

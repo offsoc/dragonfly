@@ -19,6 +19,7 @@ namespace dfly::search {
 class CompressedSortedSet {
  public:
   using IntType = DocId;
+  using ElementType = IntType;
 
   // Const access iterator that decodes the compressed list on traversal
   struct ConstIterator {
@@ -60,8 +61,23 @@ class CompressedSortedSet {
   bool Insert(IntType value);  // Insert arbitrary element, needs to scan whole list
   bool Remove(IntType value);  // Remove arbitrary element, needs to scan whole list
 
-  size_t Size() const;
-  size_t ByteSize() const;
+  size_t Size() const {
+    return size_;
+  }
+
+  size_t ByteSize() const {
+    return diffs_.size();
+  }
+
+  bool Empty() const {
+    return size_ == 0;
+  }
+
+  void Clear() {
+    size_ = 0;
+    tail_value_.reset();
+    diffs_.clear();
+  }
 
   // Add all values from other
   void Merge(CompressedSortedSet&& other);

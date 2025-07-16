@@ -36,22 +36,20 @@ class Service : public facade::ServiceInterface {
   void Shutdown();
 
   // Prepare command execution, verify and execute, reply to context
-  void DispatchCommand(ArgSlice args, facade::SinkReplyBuilder* builder,
-                       facade::ConnectionContext* cntx) final;
+  facade::DispatchResult DispatchCommand(ArgSlice args, facade::SinkReplyBuilder* builder,
+                                         facade::ConnectionContext* cntx) final;
 
   // Execute multiple consecutive commands, possibly in parallel by squashing
   size_t DispatchManyCommands(absl::Span<ArgSlice> args_list, facade::SinkReplyBuilder* builder,
                               facade::ConnectionContext* cntx) final;
 
   // Check VerifyCommandExecution and invoke command with args
-  bool InvokeCmd(const CommandId* cid, CmdArgList tail_args, facade::SinkReplyBuilder* builder,
-                 ConnectionContext* reply_cntx,
-                 std::optional<std::string_view> orig_cmd_name = std::nullopt);
+  facade::DispatchResult InvokeCmd(const CommandId* cid, CmdArgList tail_args,
+                                   const CommandContext& cmd_cntx);
 
   // Verify command can be executed now (check out of memory), always called immediately before
   // execution
-  std::optional<facade::ErrorReply> VerifyCommandExecution(const CommandId* cid,
-                                                           const ConnectionContext* cntx,
+  std::optional<facade::ErrorReply> VerifyCommandExecution(const ConnectionContext* cntx,
                                                            CmdArgList tail_args);
 
   // Verify command prepares excution in correct state.

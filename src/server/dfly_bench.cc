@@ -37,7 +37,12 @@ using std::string;
 
 ABSL_FLAG(uint16_t, p, 6379, "Server port");
 ABSL_FLAG(uint32_t, c, 20, "Number of connections per thread");
-ABSL_FLAG(uint32_t, qps, 20, "QPS schedule at which the generator sends requests to the server");
+ABSL_FLAG(int32_t, qps, 20,
+          "QPS schedule at which the generator sends requests to the server "
+          "per single connection. 0 means - coordinated omission, and positive value will throttle "
+          "the actual qps if server is slower than the target qps. "
+          "negative value means - hard target, without throttling.");
+
 ABSL_FLAG(uint32_t, n, 1000, "Number of requests to send per connection");
 ABSL_FLAG(uint32_t, test_time, 0, "Testing time in seconds");
 ABSL_FLAG(uint32_t, d, 16, "Value size in bytes ");
@@ -60,6 +65,10 @@ ABSL_FLAG(string, P, "", "protocol can be empty (for RESP) or memcache_text");
 
 ABSL_FLAG(bool, tcp_nodelay, false, "If true, set nodelay option on tcp socket");
 ABSL_FLAG(bool, noreply, false, "If true, does not wait for replies. Relevant only for memcached.");
+
+ABSL_FLAG(bool, probe_cluster, true,
+          "If false, skips cluster-mode probing and works only in single node mode");
+
 ABSL_FLAG(bool, greet, true,
           "If true, sends a greeting command on each connection, "
           "to make sure the connection succeeded");
@@ -67,6 +76,10 @@ ABSL_FLAG(bool, cluster_skip_tags, true,
           "If true, skips tags (compatible with memtier benchmark) in cluster mode, "
           "othewise adds hash tags to keys");
 ABSL_FLAG(bool, ascii, true, "If true, use ascii characters for values");
+ABSL_FLAG(bool, connect_only, false,
+          "If true, will only connect to the server, without sending "
+          "loadtest commands");
+ABSL_FLAG(string, password, "", "password to authenticate the client");
 
 using namespace std;
 using namespace util;
@@ -79,6 +92,7 @@ using tcp = ::boost::asio::ip::tcp;
 using absl::StrCat;
 
 thread_local base::Xoroshiro128p bit_gen;
+atomic_bool terminate_requested = false;
 
 #if __INTELLISENSE__
 #pragma diag_suppress 144
@@ -226,7 +240,7 @@ class KeyGenerator {
 
 class CommandGenerator {
  public:
-  CommandGenerator(KeyGenerator* keygen);
+  explicit CommandGenerator(KeyGenerator* keygen);
 
   string Next(SlotRange range);
 
@@ -360,7 +374,7 @@ string CommandGenerator::FillGet(string_view key) {
 }
 
 struct ClientStats {
-  base::Histogram hist;
+  base::Histogram total_hist, online_hist;
 
   uint64_t num_responses = 0;
   uint64_t hit_count = 0;
@@ -369,7 +383,9 @@ struct ClientStats {
   unsigned num_clients = 0;
 
   ClientStats& operator+=(const ClientStats& o) {
-    hist.Merge(o.hist);
+    total_hist.Merge(o.total_hist);
+    online_hist.Merge(o.online_hist);
+
     num_responses += o.num_responses;
     hit_count += o.hit_count;
     hit_opportunities += o.hit_opportunities;
@@ -396,6 +412,7 @@ class Driver {
 
   void Connect(unsigned index, const tcp::endpoint& ep);
   void Run(uint64_t* cycle_ns, CommandGenerator* cmd_gen);
+  void Shutdown();
 
   float done() const {
     if (time_limit_ > 0)
@@ -412,6 +429,7 @@ class Driver {
   void ReceiveFb();
   void ParseRESP();
   void ParseMC();
+  void RunCommandAndCheckResultIs(std::string_view cmd, std::string_view expected_res);
 
   struct Req {
     uint64_t start;
@@ -441,7 +459,9 @@ class TLocalClient {
 
   TLocalClient(const TLocalClient&) = delete;
 
-  void Connect(tcp::endpoint ep, const vector<tcp::endpoint>& shard_endpoints);
+  void Connect(const tcp::endpoint& ep, const vector<tcp::endpoint>& shard_endpoints);
+  void Disconnect();
+
   void Start(uint32_t key_min, uint32_t key_max, uint64_t cycle_ns);
   void Join();
 
@@ -576,6 +596,22 @@ void KeyGenerator::EnableClusterMode() {
   }
 }
 
+void RunCommandAndCheckResultIs(std::string_view cmd, std::string_view expected,
+                                FiberSocketBase* socket) {
+  auto ec = socket->Write(io::Buffer(cmd));
+  CHECK(!ec);
+
+  uint8_t buf[128];
+  auto res_sz = socket->Recv(io::MutableBytes(buf));
+  CHECK(res_sz) << res_sz.error().message();
+  string_view resp = io::View(io::Bytes(buf, *res_sz));
+  CHECK_EQ(resp, expected) << resp;
+}
+
+void Driver::RunCommandAndCheckResultIs(std::string_view cmd, std::string_view expected_res) {
+  ::RunCommandAndCheckResultIs(cmd, expected_res, socket_.get());
+}
+
 void Driver::Connect(unsigned index, const tcp::endpoint& ep) {
   VLOG(2) << "Connecting " << index << " to " << ep;
   error_code ec = socket_->Connect(ep);
@@ -585,18 +621,15 @@ void Driver::Connect(unsigned index, const tcp::endpoint& ep) {
     CHECK_EQ(0, setsockopt(socket_->native_handle(), IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)));
   }
 
-  if (absl::GetFlag(FLAGS_greet)) {
+  auto password = absl::GetFlag(FLAGS_password);
+  if (!password.empty()) {
+    auto command = absl::StrCat("AUTH ", password, "\r\n");
+    RunCommandAndCheckResultIs(command, "+OK\r\n");
+  } else if (absl::GetFlag(FLAGS_greet)) {
     // TCP Connect does not ensure that the connection was indeed accepted by the server.
     // if server backlog is too short the connection will get stuck in the accept queue.
     // Therefore, we send a ping command to ensure that every connection got connected.
-    ec = socket_->Write(io::Buffer("ping\r\n"));
-    CHECK(!ec);
-
-    uint8_t buf[128];
-    auto res_sz = socket_->Recv(io::MutableBytes(buf));
-    CHECK(res_sz) << res_sz.error().message();
-    string_view resp = io::View(io::Bytes(buf, *res_sz));
-    CHECK(absl::EndsWith(resp, "\r\n")) << resp;
+    RunCommandAndCheckResultIs("PING\r\n", "+PONG\r\n");
   }
   ep_ = ep;
   receive_fb_ = MakeFiber(fb2::Launch::dispatch, [this] { ReceiveFb(); });
@@ -604,24 +637,56 @@ void Driver::Connect(unsigned index, const tcp::endpoint& ep) {
 
 void Driver::Run(uint64_t* cycle_ns, CommandGenerator* cmd_gen) {
   start_ns_ = absl::GetCurrentTimeNanos();
-  unsigned pipeline = GetFlag(FLAGS_pipeline);
+  uint32_t pipeline = std::max<uint32_t>(GetFlag(FLAGS_pipeline), 1u);
+  bool should_throttle = GetFlag(FLAGS_qps) > 0;
 
   stats_.num_clients++;
   int64_t time_limit_ns =
       time_limit_ > 0 ? int64_t(time_limit_) * 1'000'000'000 + start_ns_ : INT64_MAX;
-
+  int64_t now = start_ns_;
   SlotRange slot_range{0, kNumSlots - 1};
+  CHECK_GT(num_reqs_, 0u);
 
-  for (unsigned i = 0; i < num_reqs_; ++i) {
-    int64_t now = absl::GetCurrentTimeNanos();
+  uint32_t num_batches = ((num_reqs_ - 1) / pipeline) + 1;
 
-    if (now > time_limit_ns) {
-      break;
+  for (unsigned i = 0; i < num_batches && now < time_limit_ns && !terminate_requested; ++i) {
+    if (i == num_batches - 1) {  // last batch
+      pipeline = num_reqs_ - i * pipeline;
     }
+
+    for (unsigned j = 0; j < pipeline; ++j) {
+      // TODO: this skews the distribution if slot ranges are uneven.
+      // Ideally we would like to pick randomly a single slot from all the ranges we have
+      // and pass it to cmd_gen->Next below.
+      if (!shard_slots_.Empty()) {
+        slot_range = shard_slots_.NextSlotRange(ep_, i);
+      }
+
+      string cmd = cmd_gen->Next(slot_range);
+
+      Req req;
+      req.start = absl::GetCurrentTimeNanos();
+      req.might_hit = cmd_gen->might_hit();
+
+      reqs_.push(req);
+
+      error_code ec = socket_->Write(io::Buffer(cmd));
+      if (ec && FiberSocketBase::IsConnClosed(ec)) {
+        // TODO: report failure
+        VLOG(1) << "Connection closed";
+        break;
+      }
+      CHECK(!ec) << ec.message();
+      if (cmd_gen->noreply()) {
+        PopRequest();
+      }
+    }
+
+    now = absl::GetCurrentTimeNanos();
     if (cycle_ns) {
       int64_t target_ts = start_ns_ + i * (*cycle_ns);
       int64_t sleep_ns = target_ts - now;
-      if (reqs_.size() > 10 && sleep_ns <= 0) {
+      if (reqs_.size() > pipeline * 2 && should_throttle && sleep_ns <= 0) {
         sleep_ns = 10'000;
       }
 
@@ -630,7 +695,7 @@ void Driver::Run(uint64_t* cycle_ns, CommandGenerator* cmd_gen) {
         // There is no point in sending more requests if they are piled up in the server.
         do {
           ThisFiber::SleepFor(chrono::nanoseconds(sleep_ns));
-        } while (reqs_.size() > 10);
+        } while (should_throttle && reqs_.size() > pipeline * 2);
       } else if (i % 256 == 255) {
         ThisFiber::Yield();
         VLOG(5) << "Behind QPS schedule";
@@ -639,33 +704,7 @@ void Driver::Run(uint64_t* cycle_ns, CommandGenerator* cmd_gen) {
       // Coordinated omission.
 
       fb2::NoOpLock lk;
-      cnd_.wait(lk, [this, pipeline] { return reqs_.size() < pipeline; });
-    }
-
-    // TODO: this skews the distribution if slot ranges are uneven.
-    // Ideally we would like to pick randomly a single slot from all the ranges we have
-    // and pass it to cmd_gen->Next below.
-    if (!shard_slots_.Empty()) {
-      slot_range = shard_slots_.NextSlotRange(ep_, i);
-    }
-
-    string cmd = cmd_gen->Next(slot_range);
-
-    Req req;
-    req.start = absl::GetCurrentTimeNanos();
-    req.might_hit = cmd_gen->might_hit();
-
-    reqs_.push(req);
-
-    error_code ec = socket_->Write(io::Buffer(cmd));
-    if (ec && FiberSocketBase::IsConnClosed(ec)) {
-      // TODO: report failure
-      VLOG(1) << "Connection closed";
-      break;
-    }
-    CHECK(!ec) << ec.message();
-    if (cmd_gen->noreply()) {
-      PopRequest();
+      cnd_.wait(lk, [this] { return reqs_.empty(); });
     }
   }
 
@@ -678,7 +717,10 @@ void Driver::Run(uint64_t* cycle_ns, CommandGenerator* cmd_gen) {
   while (!reqs_.empty()) {
     ThisFiber::SleepFor(1ms);
   }
+  Shutdown();
+}
 
+void Driver::Shutdown() {
   std::ignore = socket_->Shutdown(SHUT_RDWR);  // breaks the receive fiber.
   receive_fb_.Join();
   std::ignore = socket_->Close();
@@ -699,7 +741,8 @@ static string_view FindLine(io::Bytes buf) {
 void Driver::PopRequest() {
   uint64_t now = absl::GetCurrentTimeNanos();
   uint64_t usec = (now - reqs_.front().start) / 1000;
-  stats_.hist.Add(usec);
+  stats_.online_hist.Add(usec);
+  stats_.total_hist.Add(usec);
   stats_.hit_opportunities += reqs_.front().might_hit;
   ++received_;
   reqs_.pop();
@@ -818,8 +861,8 @@ void Driver::ParseMC() {
   }
 }
 
-void TLocalClient::Connect(tcp::endpoint ep, const vector<tcp::endpoint>& endpoints) {
-  VLOG(2) << "Connecting client...";
+void TLocalClient::Connect(const tcp::endpoint& ep, const vector<tcp::endpoint>& endpoints) {
+  VLOG(2) << "Connecting client..." << ep;
 
   unsigned conn_per_shard = GetFlag(FLAGS_c);
   if (shard_slots_->Empty()) {
@@ -840,14 +883,18 @@ void TLocalClient::Connect(tcp::endpoint ep, const vector<tcp::endpoint>& endpoi
       size_t shard = i / conn_per_shard;
       shard_ep = endpoints[shard];
     }
-    fbs[i] = MakeFiber([&, shard_ep, i] {
-      ThisFiber::SetName(StrCat("connect/", i));
-      drivers_[i]->Connect(i, shard_ep);
-    });
+    fbs[i] =
+        fb2::Fiber(StrCat("connect/", i), [&, shard_ep, i] { drivers_[i]->Connect(i, shard_ep); });
   }
 
   for (auto& fb : fbs)
     fb.Join();
+}
+
+void TLocalClient::Disconnect() {
+  for (size_t i = 0; i < drivers_.size(); ++i) {
+    drivers_[i]->Shutdown();
+  }
 }
 
 void TLocalClient::Start(uint32_t key_min, uint32_t key_max, uint64_t cycle_ns) {
@@ -908,12 +955,15 @@ void WatchFiber(size_t num_shards, atomic_bool* finish_signal, ProactorPool* pp)
   num_shards = max<size_t>(num_shards, 1u);
   uint64_t resp_goal = GetFlag(FLAGS_c) * pp->size() * GetFlag(FLAGS_n) * num_shards;
   uint32_t time_limit = GetFlag(FLAGS_test_time);
+  bool should_throttle = GetFlag(FLAGS_qps) > 0;
 
   while (*finish_signal == false) {
     // we sleep with resolution of 1s but print with lower frequency to be more responsive
     // when benchmark finishes.
     ThisFiber::SleepFor(1s);
-    pp->AwaitBrief([](auto, auto*) { client->AdjustCycle(); });
+    if (should_throttle) {
+      pp->AwaitBrief([](auto, auto*) { client->AdjustCycle(); });
+    }
 
     int64_t now = absl::GetCurrentTimeNanos();
     if (now - last_print < 5000'000'000LL)  // 5s
@@ -933,6 +983,7 @@ void WatchFiber(size_t num_shards, atomic_bool* finish_signal, ProactorPool* pp)
       done_max = max(done_max, maxd);
       done_min = min(done_min, mind);
       max_pending = max(max_pending, max_pend);
+      client->stats.online_hist.Clear();
     });
 
     uint64_t total_ms = (now - start_time) / 1'000'000;
@@ -943,7 +994,7 @@ void WatchFiber(size_t num_shards, atomic_bool* finish_signal, ProactorPool* pp)
     double hitrate = stats.hit_opportunities > 0
                          ? 100 * double(stats.hit_count) / double(stats.hit_opportunities)
                          : 0;
-    unsigned latency = stats.hist.Percentile(99);
+    unsigned latency = stats.online_hist.Percentile(99);
 
     CONSOLE_INFO << total_ms / 1000 << "s: " << StrFormat("%.1f", done_perc)
                  << "% done, RPS(now/agg): " << period_resp_cnt * 1000 / period_ms << "/"
@@ -963,6 +1014,11 @@ ClusterShards FetchClusterInfo(const tcp::endpoint& ep, ProactorBase* proactor) 
   unique_ptr<FiberSocketBase> socket(proactor->CreateSocket());
   error_code ec = socket->Connect(ep);
   CHECK(!ec) << "Could not connect to " << ep << " " << ec;
+
+  if (const auto password = GetFlag(FLAGS_password); !password.empty()) {
+    RunCommandAndCheckResultIs(StrFormat("AUTH %s\r\n", password), "+OK\r\n", socket.get());
+  }
+
   ec = socket->Write(io::Buffer("cluster nodes\r\n"));
   CHECK(!ec);
   facade::RedisParser parser{RedisParser::CLIENT, 1024};
@@ -1048,6 +1104,11 @@ int main(int argc, char* argv[]) {
   pp->Run();
   fb2::InitDnsResolver(2000);
 
+  ProactorBase::RegisterSignal({SIGTERM}, pp->GetNextProactor(), [](int) {
+    CONSOLE_INFO << "terminate requested";
+    terminate_requested = true;
+  });
+
   string proto_str = GetFlag(FLAGS_P);
   if (proto_str == "memcache_text") {
     protocol = MC_TEXT;
@@ -1081,12 +1142,12 @@ int main(int argc, char* argv[]) {
   tcp::endpoint ep{address, GetFlag(FLAGS_p)};
 
   ClusterShards shards;
-  if (protocol == RESP) {
+  if (protocol == RESP && GetFlag(FLAGS_probe_cluster)) {
     shards = proactor->Await([&] { return FetchClusterInfo(ep, proactor); });
   }
-  LOG(INFO) << "Connecting threads to "
-            << (shards.empty() ? string("single node ")
-                               : absl::StrCat(shards.size(), " shard cluster"));
+  CONSOLE_INFO << "Connecting to "
+               << (shards.empty() ? string("single node ")
+                                  : absl::StrCat(shards.size(), " shard cluster"));
 
   if (!shards.empty() && !GetFlag(FLAGS_command).empty() && GetFlag(FLAGS_cluster_skip_tags)) {
     // For custom commands we may need to use the same hashtag for multiple keys.
@@ -1097,67 +1158,77 @@ int main(int argc, char* argv[]) {
   ShardSlots shard_slots;
   shard_slots.SetClusterSlotRanges(shards);
   std::vector<tcp::endpoint> shard_endpoints = shard_slots.Endpoints();
-
-  pp->AwaitFiberOnAll([&](unsigned index, auto* p) {
+  pp->AwaitBrief([&](unsigned index, auto* p) {
     base::SplitMix64 seed_mix(GetFlag(FLAGS_seed) + index * 0x6a45554a264d72bULL);
     auto seed = seed_mix();
     VLOG(1) << "Seeding bitgen with seed " << seed;
     bit_gen.seed(seed);
+  });
+
+  pp->AwaitFiberOnAll([&](unsigned index, auto* p) {
     client = make_unique<TLocalClient>(p, &shard_slots);
     client->Connect(ep, shard_endpoints);
   });
 
-  const uint32_t key_minimum = GetFlag(FLAGS_key_minimum);
-  const uint32_t key_maximum = GetFlag(FLAGS_key_maximum);
-  CHECK_LE(key_minimum, key_maximum);
-
-  uint32_t thread_key_step = 0;
-  const uint32_t qps = GetFlag(FLAGS_qps);
-  const int64_t interval = qps ? 1'000'000'000LL / qps : 0;
-  uint64_t num_reqs = GetFlag(FLAGS_n);
-  uint64_t total_conn_num = GetFlag(FLAGS_c) * pp->size();
-  uint64_t total_requests = num_reqs * total_conn_num;
-  uint32_t time_limit = GetFlag(FLAGS_test_time);
-
-  if (dist_type == SEQUENTIAL) {
-    thread_key_step = std::max(1UL, (key_maximum - key_minimum + 1) / pp->size());
-    if (total_requests > (key_maximum - key_minimum)) {
-      CONSOLE_INFO << "Warning: only " << key_maximum - key_minimum
-                   << " unique entries will be accessed with " << total_requests
-                   << " total requests";
-    }
-  }
-
-  if (!time_limit) {
-    CONSOLE_INFO << "Running " << pp->size() << " threads, sending " << num_reqs
-                 << " requests per each connection, or " << total_requests << " requests overall";
-  }
-  if (interval) {
-    CONSOLE_INFO << "At a rate of " << GetFlag(FLAGS_qps)
-                 << " rps per connection, i.e. request every " << interval / 1000 << "us";
-    CONSOLE_INFO << "Overall scheduled RPS: " << qps * total_conn_num;
+  absl::Duration duration;
+  if (absl::GetFlag(FLAGS_connect_only)) {
+    pp->AwaitFiberOnAll([&](unsigned index, auto* p) { client->Disconnect(); });
   } else {
-    CONSOLE_INFO << "Coordinated omission mode - the rate is determined by the server";
+    const uint32_t key_minimum = GetFlag(FLAGS_key_minimum);
+    const uint32_t key_maximum = GetFlag(FLAGS_key_maximum);
+    CHECK_LE(key_minimum, key_maximum);
+
+    uint32_t thread_key_step = 0;
+    uint32_t qps = abs(GetFlag(FLAGS_qps));
+    bool throttle = GetFlag(FLAGS_qps) > 0;
+    const int64_t interval = qps ? 1'000'000'000LL / qps : 0;
+    uint64_t num_reqs = GetFlag(FLAGS_n);
+
+    uint64_t total_conn_num = GetFlag(FLAGS_c) * pp->size();
+    uint64_t total_requests = num_reqs * total_conn_num;
+    uint32_t time_limit = GetFlag(FLAGS_test_time);
+
+    if (dist_type == SEQUENTIAL) {
+      thread_key_step = std::max(1UL, (key_maximum - key_minimum + 1) / pp->size());
+      if (total_requests > (key_maximum - key_minimum)) {
+        CONSOLE_INFO << "Warning: only " << key_maximum - key_minimum
+                     << " unique entries will be accessed with " << total_requests
+                     << " total requests";
+      }
+    }
+
+    if (!time_limit) {
+      CONSOLE_INFO << "Running " << pp->size() << " threads, sending " << num_reqs
+                   << " requests per each connection, or " << total_requests << " requests overall "
+                   << (throttle ? "with" : "without") << " throttling";
+    }
+    if (interval) {
+      CONSOLE_INFO << "At a rate of " << qps << " rps per connection, i.e. request every "
+                   << interval / 1000 << "us";
+      CONSOLE_INFO << "Overall scheduled RPS: " << qps * total_conn_num;
+    } else {
+      CONSOLE_INFO << "Coordinated omission mode - the rate is determined by the server";
+    }
+
+    atomic_bool finish{false};
+    pp->AwaitBrief([&](unsigned index, auto* p) {
+      uint32_t key_max = (thread_key_step > 0 && index + 1 < pp->size())
+                             ? key_minimum + (index + 1) * thread_key_step - 1
+                             : key_maximum;
+      client->Start(key_minimum + index * thread_key_step, key_max, interval);
+    });
+
+    auto watch_fb =
+        pp->GetNextProactor()->LaunchFiber([&] { WatchFiber(shards.size(), &finish, pp.get()); });
+    const absl::Time start_time = absl::Now();
+
+    // The actual run.
+    pp->AwaitFiberOnAll([&](unsigned index, auto* p) { client->Join(); });
+
+    duration = absl::Now() - start_time;
+    finish.store(true);
+    watch_fb.Join();
   }
-
-  atomic_bool finish{false};
-  pp->AwaitBrief([&](unsigned index, auto* p) {
-    uint32_t key_max = (thread_key_step > 0 && index + 1 < pp->size())
-                           ? key_minimum + (index + 1) * thread_key_step - 1
-                           : key_maximum;
-    client->Start(key_minimum + index * thread_key_step, key_max, interval);
-  });
-
-  auto watch_fb =
-      pp->GetNextProactor()->LaunchFiber([&] { WatchFiber(shards.size(), &finish, pp.get()); });
-  const absl::Time start_time = absl::Now();
-
-  // The actual run.
-  pp->AwaitFiberOnAll([&](unsigned index, auto* p) { client->Join(); });
-
-  absl::Duration duration = absl::Now() - start_time;
-  finish.store(true);
-  watch_fb.Join();
 
   fb2::Mutex mutex;
 
@@ -1176,13 +1247,13 @@ int main(int argc, char* argv[]) {
   CONSOLE_INFO << "\nTotal time: " << duration
                << ". Overall number of requests: " << summary.num_responses
                << ", QPS: " << (dur_sec ? StrCat(summary.num_responses / dur_sec) : "nan")
-               << ", P99 lat: " << summary.hist.Percentile(99) << "us";
+               << ", P99 lat: " << summary.total_hist.Percentile(99) << "us";
 
   if (summary.num_errors) {
     CONSOLE_INFO << "Got " << summary.num_errors << " error responses!";
   }
 
-  CONSOLE_INFO << "Latency summary, all times are in usec:\n" << summary.hist.ToString();
+  CONSOLE_INFO << "Latency summary, all times are in usec:\n" << summary.total_hist.ToString();
   if (summary.hit_opportunities) {
     CONSOLE_INFO << "----------------------------------\nHit rate: "
                  << 100 * double(summary.hit_count) / double(summary.hit_opportunities) << "%\n";

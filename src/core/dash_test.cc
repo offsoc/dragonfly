@@ -2,9 +2,8 @@
 // See LICENSE for licensing terms.
 //
 
+#include <cstdint>
 #define ENABLE_DASH_STATS
-
-#include "core/dash.h"
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/strings/str_cat.h>
@@ -17,6 +16,7 @@
 #include "base/hash.h"
 #include "base/logging.h"
 #include "base/zipf_gen.h"
+#include "core/dash.h"
 #include "io/file.h"
 #include "io/line_reader.h"
 
@@ -76,15 +76,22 @@ struct Buf24 {
   }
 };
 
+struct BasicDashPolicy {
+  enum { kSlotNum = 12, kBucketNum = 64 };
+  static constexpr bool kUseVersion = false;
+
+  template <typename U> static void DestroyValue(const U&) {
+  }
+  template <typename U> static void DestroyKey(const U&) {
+  }
+
+  template <typename U, typename V> static bool Equal(U&& u, V&& v) {
+    return u == v;
+  }
+};
 struct UInt64Policy : public BasicDashPolicy {
   static uint64_t HashFn(uint64_t v) {
     return XXH3_64bits(&v, sizeof(v));
-  }
-};
-
-struct RelaxedBumpPolicy {
-  bool CanBump(uint64_t key) const {
-    return true;
   }
 };
 
@@ -124,17 +131,25 @@ class CappedResource final : public PMR_NS::memory_resource {
 using Segment = detail::Segment<uint64_t, Buf24>;
 using Dash64 = DashTable<uint64_t, uint64_t, UInt64Policy>;
 
+struct RelaxedBumpPolicy {
+  bool CanBump(uint64_t key) const {
+    return true;
+  }
+  void OnMove(Dash64::Cursor source, Dash64::Cursor dest) {
+  }
+};
+
 constexpr auto kSegTax = Segment::kTaxSize;
 constexpr size_t kMaxSize = Segment::kMaxSize;
 constexpr size_t kSegSize = sizeof(Segment);
 
 class DashTest : public testing::Test {
  protected:
-  static void SetUpTestCase() {
+  static void SetUpTestSuite() {
     init_zmalloc_threadlocal(mi_heap_get_backing());
   }
 
-  DashTest() : segment_(1) {
+  DashTest() : segment_(1, 0, PMR_NS::get_default_resource()) {
   }
 
   bool Find(Segment::Key_t key, Segment::Value_t* val) const {
@@ -161,7 +176,6 @@ class DashTest : public testing::Test {
 
 set<Segment::Key_t> DashTest::FillSegment(unsigned bid) {
   std::set<Segment::Key_t> keys;
-
   for (Segment::Key_t key = 0; key < 1000000u; ++key) {
     uint64_t hash = dt_.DoHash(key);
     unsigned bi = (hash >> 8) % Segment::kBucketNum;
@@ -170,7 +184,7 @@ set<Segment::Key_t> DashTest::FillSegment(unsigned bid) {
     uint8_t fp = hash & 0xFF;
     if (fp > 2)  // limit fps considerably to find interesting cases.
       continue;
-    auto [it, success] = segment_.Insert(key, 0, hash, EqTo(key));
+    auto [it, success] = segment_.Insert(key, 0, hash, EqTo(key), [](auto&&...) {});
     if (!success) {
       LOG(INFO) << "Stopped at " << key;
       break;
@@ -204,8 +218,8 @@ TEST_F(DashTest, Basic) {
   Segment::Value_t val = 0;
   uint64_t hash = dt_.DoHash(key);
 
-  EXPECT_TRUE(segment_.Insert(key, val, hash, EqTo(key)).second);
-  auto [it, res] = segment_.Insert(key, val, hash, EqTo(key));
+  EXPECT_TRUE(segment_.Insert(key, val, hash, EqTo(key), [](auto&&...) {}).second);
+  auto [it, res] = segment_.Insert(key, val, hash, EqTo(key), [](auto&&...) {});
   EXPECT_TRUE(!res && it.found());
 
   EXPECT_TRUE(Find(key, &val));
@@ -227,7 +241,7 @@ TEST_F(DashTest, Basic) {
 }
 
 TEST_F(DashTest, Segment) {
-  std::unique_ptr<Segment> seg(new Segment(1));
+  std::unique_ptr<Segment> seg(new Segment(1, 0, PMR_NS::get_default_resource()));
 
 #ifndef __APPLE__
   LOG(INFO) << "Segment size " << sizeof(Segment)
@@ -240,8 +254,8 @@ TEST_F(DashTest, Segment) {
   for (size_t i = 2; i < Segment::kBucketNum; ++i) {
     EXPECT_EQ(0, segment_.GetBucket(i).Size());
   }
-  EXPECT_EQ(4 * Segment::kSlotNum, keys.size());
-  EXPECT_EQ(4 * Segment::kSlotNum, segment_.SlowSize());
+  EXPECT_EQ(6 * Segment::kSlotNum, keys.size());
+  EXPECT_EQ(6 * Segment::kSlotNum, segment_.SlowSize());
 
   auto hfun = &UInt64Policy::HashFn;
   unsigned has_called = 0;
@@ -268,16 +282,15 @@ TEST_F(DashTest, Segment) {
     ASSERT_TRUE(it.found());
     segment_.Delete(it, hash);
   }
-  EXPECT_EQ(2 * Segment::kSlotNum, segment_.SlowSize());
+  EXPECT_EQ(4 * Segment::kSlotNum, segment_.SlowSize());
   ASSERT_FALSE(Contains(arr.front()));
 }
 
 TEST_F(DashTest, SegmentFull) {
-  std::equal_to<Segment::Key_t> eq;
-
+  std::equal_to<> eq;
   for (Segment::Key_t key = 8000; key < 15000u; ++key) {
     uint64_t hash = dt_.DoHash(key);
-    bool res = segment_.Insert(key, 0, hash, eq).second;
+    bool res = segment_.Insert(key, 0, hash, eq, [](auto&&...) {}).second;
     if (!res) {
       LOG(INFO) << "Stopped at " << key;
       break;
@@ -310,13 +323,39 @@ TEST_F(DashTest, SegmentFull) {
   }
 }
 
+TEST_F(DashTest, FirstStash) {
+  constexpr unsigned kRegularCapacity = Segment::kBucketNum * Segment::kSlotNum;
+  unsigned less_seventy = 0;
+  for (unsigned j = 0; j < 100; ++j) {
+    unsigned num_items = 0;
+    for (unsigned i = 0; i < 1000; ++i) {
+      uint64_t key = i + j * 2000;
+      uint64_t hash = dt_.DoHash(key);
+      auto [it, inserted] = segment_.Insert(key, 0, hash, equal_to<>{}, [](auto&&...) {});
+      ASSERT_TRUE(inserted);
+      if (it.index >= Segment::kBucketNum) {  // stash iterator
+        break;
+      }
+      ++num_items;
+    }
+    segment_.Clear();
+
+    // With high probability, we can expect 66% of the keys added without stashes.
+    ASSERT_GT(num_items, kRegularCapacity * 0.66);
+    if (num_items < kRegularCapacity * 0.7) {
+      ++less_seventy;
+    }
+  }
+  LOG(INFO) << "Less than 70% of keys in regular buckets: " << less_seventy;
+}
+
 TEST_F(DashTest, Split) {
   // fills segment with maximum keys that must reside in bucket id 0.
   set<Segment::Key_t> keys = FillSegment(0);
   Segment::Value_t val;
-  Segment s2{2};  // segment with local depth 2.
+  Segment s2{2, 0, PMR_NS::get_default_resource()};  // segment with local depth 2.
 
-  segment_.Split(&UInt64Policy::HashFn, &s2);
+  segment_.Split(&UInt64Policy::HashFn, &s2, [](auto&...) {});
   unsigned sum[2] = {0};
   for (auto key : keys) {
     auto eq = [key](const auto& probe) { return key == probe; };
@@ -331,17 +370,7 @@ TEST_F(DashTest, Split) {
   ASSERT_EQ(segment_.SlowSize(), sum[0]);
   EXPECT_EQ(s2.SlowSize(), sum[1]);
   EXPECT_EQ(keys.size(), sum[0] + sum[1]);
-  EXPECT_EQ(4 * Segment::kSlotNum, keys.size());
-}
-
-TEST_F(DashTest, Merge) {
-  set<Segment::Key_t> keys = FillSegment(0);
-  Segment s2{2};  // segment with local depth 2.
-
-  segment_.Split(&UInt64Policy::HashFn, &s2);
-  ASSERT_EQ(segment_.SlowSize() + s2.SlowSize(), keys.size());
-  segment_.MoveFrom(&UInt64Policy::HashFn, &s2);
-  EXPECT_EQ(segment_.SlowSize(), keys.size());
+  EXPECT_EQ(6 * Segment::kSlotNum, keys.size());
 }
 
 TEST_F(DashTest, BumpUp) {
@@ -373,12 +402,21 @@ TEST_F(DashTest, BumpUp) {
   EXPECT_EQ(touched_bid[1], 1);
 
   // Bump up
-  segment_.BumpUp(kFirstStashId, 5, hash, RelaxedBumpPolicy{});
+  std::vector<std::pair<uint8_t, uint8_t>> moved_buckets;
+  auto move_cb = [&moved_buckets](uint32_t /* segment_id */, uint8_t a, uint8_t b) {
+    moved_buckets.emplace_back(a, b);
+  };
+  segment_.BumpUp(kFirstStashId, 5, hash, RelaxedBumpPolicy{}, move_cb);
 
   // expect the key to move
   EXPECT_TRUE(segment_.GetBucket(1).IsFull());
   EXPECT_FALSE(segment_.GetBucket(kFirstStashId).IsFull());
   EXPECT_EQ(segment_.Key(1, 2), key);
+  EXPECT_EQ(moved_buckets.size(), 1);
+  EXPECT_EQ(moved_buckets.at(0).first, kFirstStashId);
+  EXPECT_EQ(moved_buckets.at(0).second, 1);
+  moved_buckets.clear();
+
   EXPECT_TRUE(Contains(key));
 
   // 9 is just a random slot id.
@@ -393,17 +431,24 @@ TEST_F(DashTest, BumpUp) {
   EXPECT_EQ(touched_bid[1], 0);
   EXPECT_EQ(touched_bid[2], 1);
 
-  segment_.BumpUp(kSecondStashId, 9, hash, RelaxedBumpPolicy{});
+  auto it = segment_.BumpUp(kSecondStashId, 9, hash, RelaxedBumpPolicy{}, move_cb);
   ASSERT_TRUE(key == segment_.Key(0, kSlotNum - 1) || key == segment_.Key(1, kSlotNum - 1));
   EXPECT_TRUE(segment_.GetBucket(kSecondStashId).IsFull());
   EXPECT_TRUE(Contains(key));
   EXPECT_TRUE(segment_.Key(kSecondStashId, 9));
+  EXPECT_EQ(moved_buckets.size(), 2);
+  EXPECT_EQ(moved_buckets.at(0).first, kSecondStashId);
+  EXPECT_EQ(moved_buckets.at(0).second, it.index);
+  EXPECT_EQ(moved_buckets.at(1).first, it.index);
+  EXPECT_EQ(moved_buckets.at(1).second, kSecondStashId);
 }
 
 TEST_F(DashTest, BumpPolicy) {
   struct RestrictedBumpPolicy {
     bool CanBump(uint64_t key) const {
       return false;
+    }
+    void OnMove(Dash64::Cursor source, Dash64::Cursor dest) {
     }
   };
 
@@ -417,13 +462,13 @@ TEST_F(DashTest, BumpPolicy) {
   // check items are immovable in bucket
   Segment::Key_t key = segment_.Key(1, 2);
   uint64_t hash = dt_.DoHash(key);
-  segment_.BumpUp(1, 2, hash, RestrictedBumpPolicy{});
+  segment_.BumpUp(1, 2, hash, RestrictedBumpPolicy{}, [](auto&&...) {});
   EXPECT_EQ(key, segment_.Key(1, 2));
 
   // check items don't swap from stash
   key = segment_.Key(kFirstStashId, 2);
   hash = dt_.DoHash(key);
-  segment_.BumpUp(kFirstStashId, 2, hash, RestrictedBumpPolicy{});
+  segment_.BumpUp(kFirstStashId, 2, hash, RestrictedBumpPolicy{}, [](auto&&...) {});
   EXPECT_EQ(key, segment_.Key(kFirstStashId, 2));
 }
 
@@ -456,12 +501,12 @@ struct Item {
 
 constexpr size_t ItemAlign = alignof(Item);
 
-struct MyBucket : public detail::BucketBase<16, 4> {
+struct MyBucket : public detail::BucketBase<16> {
   Item key[14];
 };
 
 constexpr size_t kMySz = sizeof(MyBucket);
-constexpr size_t kBBSz = sizeof(detail::BucketBase<16, 4>);
+constexpr size_t kBBSz = sizeof(detail::BucketBase<16>);
 
 TEST_F(DashTest, Custom) {
   using ItemSegment = detail::Segment<Item, uint64_t>;
@@ -474,7 +519,7 @@ TEST_F(DashTest, Custom) {
   (void)kSegSize;
   (void)kBuckSz;
 
-  ItemSegment seg{2};
+  ItemSegment seg{2, 0, PMR_NS::get_default_resource()};
 
   auto eq = [v = Item{1, 1}](auto u) { return v.buf[0] == u.buf[0] && v.buf[1] == u.buf[1]; };
   auto it = seg.FindIt(42, eq);
@@ -483,12 +528,16 @@ TEST_F(DashTest, Custom) {
 
 TEST_F(DashTest, FindByValue) {
   using ItemSegment = detail::Segment<Item, uint64_t>;
+  auto no_op_cb = [](auto&&...) {};
 
   // Insert three different values with the same hash
-  ItemSegment segment{2};
-  segment.Insert(Item{1}, 1, 42, [](const auto& pred) { return pred.buf[0] == 1; });
-  segment.Insert(Item{2}, 2, 42, [](const auto& pred) { return pred.buf[0] == 2; });
-  segment.Insert(Item{3}, 3, 42, [](const auto& pred) { return pred.buf[0] == 3; });
+  ItemSegment segment{2, 0, PMR_NS::get_default_resource()};
+  segment.Insert(
+      Item{1}, 1, 42, [](const auto& pred) { return pred.buf[0] == 1; }, no_op_cb);
+  segment.Insert(
+      Item{2}, 2, 42, [](const auto& pred) { return pred.buf[0] == 2; }, no_op_cb);
+  segment.Insert(
+      Item{3}, 3, 42, [](const auto& pred) { return pred.buf[0] == 3; }, no_op_cb);
 
   // We should be able to find the middle one by value
   auto it = segment.FindIt(42, [](const auto& key, const auto& value) { return value == 2; });
@@ -635,11 +684,13 @@ struct TestEvictionPolicy {
   bool CanGrow(const Dash64& tbl) const {
     return tbl.capacity() < max_capacity;
   }
+  void OnMove(Dash64::Cursor source, Dash64::Cursor dest) {
+  }
 
   void RecordSplit(Dash64::Segment_t*) {
   }
 
-  unsigned Evict(const Dash64::HotspotBuckets& hotb, Dash64* me) const {
+  unsigned Evict(const Dash64::HotBuckets& hotb, Dash64* me) const {
     if (!evict_enabled)
       return 0;
 
@@ -659,7 +710,7 @@ struct TestEvictionPolicy {
 };
 
 TEST_F(DashTest, Eviction) {
-  TestEvictionPolicy ev(1500);
+  TestEvictionPolicy ev(1540);
 
   size_t num = 0;
   auto loop = [&] {
@@ -670,6 +721,7 @@ TEST_F(DashTest, Eviction) {
 
   ASSERT_THROW(loop(), bad_alloc);
   ASSERT_LT(num, 5000);
+  ASSERT_EQ(2, dt_.unique_segments());
   EXPECT_LT(dt_.size(), ev.max_capacity);
   LOG(INFO) << "size is " << dt_.size();
 
@@ -746,6 +798,9 @@ TEST_F(DashTest, Version) {
   EXPECT_EQ(5, it.GetVersion());
 
   dt.Clear();
+  ASSERT_EQ(0, dt.size());
+  ASSERT_EQ(2, dt.unique_segments());
+  ASSERT_EQ(136, dt.bucket_count());
   constexpr int kNum = 68000;
   for (int i = 0; i < kNum; ++i) {
     auto it = dt.Insert(i, 0).first;
@@ -795,6 +850,16 @@ TEST_F(DashTest, CVCUponInsert) {
   dt.CVCUponInsert(1, i, cb);
 }
 
+TEST_F(DashTest, CVCUponInsertStress) {
+  VersionDT dt;
+  for (int i = 0; i < 5000; ++i) {
+    dt.CVCUponInsert(1, i, [](VersionDT::bucket_iterator) {
+      // empty callback
+    });
+    dt.Insert(i, 0);
+  }
+}
+
 struct A {
   int a = 0;
   unsigned moved = 0;
@@ -807,7 +872,7 @@ struct A {
   }
 
   A& operator=(const A&) = delete;
-  A& operator=(A&& o) {
+  A& operator=(A&& o) noexcept {
     o.moved = o.moved + 1;
     a = o.a;
     o.a = -1;
@@ -949,14 +1014,17 @@ struct SimpleEvictPolicy {
     return tbl.capacity() + U64Dash::kSegCapacity < max_capacity;
   }
 
+  void OnMove(U64Dash::Cursor source, U64Dash::Cursor dest) {
+  }
+
   void RecordSplit(U64Dash::Segment_t* segment) {
   }
 
   // Required interface in case can_gc is true
   // returns number of items evicted from the table.
   // 0 means - nothing has been evicted.
-  unsigned Evict(const U64Dash::HotspotBuckets& hotb, U64Dash* me) {
-    constexpr unsigned kBucketNum = U64Dash::HotspotBuckets::kNumBuckets;
+  unsigned Evict(const U64Dash::HotBuckets& hotb, U64Dash* me) {
+    constexpr unsigned kBucketNum = U64Dash::HotBuckets::kNumBuckets;
 
     uint32_t bid = hotb.key_hash % kBucketNum;
 
@@ -997,7 +1065,10 @@ struct ShiftRightPolicy {
   void RecordSplit(U64Dash::Segment_t* segment) {
   }
 
-  unsigned Evict(const U64Dash::HotspotBuckets& hotb, U64Dash* me) {
+  void OnMove(U64Dash::Cursor source, U64Dash::Cursor dest) {
+  }
+
+  unsigned Evict(const U64Dash::HotBuckets& hotb, U64Dash* me) {
     constexpr unsigned kNumStashBuckets = ABSL_ARRAYSIZE(hotb.probes.by_type.stash_buckets);
 
     unsigned stash_pos = hotb.key_hash % kNumStashBuckets;
@@ -1005,7 +1076,7 @@ struct ShiftRightPolicy {
     stash_it += (U64Dash::kSlotNum - 1);  // go to the last slot.
 
     uint64_t k = stash_it->first;
-    DVLOG(1) << "Deleting key " << k << " from " << stash_it.bucket_id() << "/"
+    DVLOG(1) << "Deleting key " << k << " from " << unsigned(stash_it.bucket_id()) << "/"
              << stash_it.slot_id();
     evicted[k]++;
 
@@ -1086,8 +1157,11 @@ TEST_P(EvictionPolicyTest, HitRateZipf) {
       DVLOG(1) << "Inserted new key " << key << " to bucket " << it.bucket_id() << " slot "
                << it.slot_id();
     } else {
-      if (use_bumps)
-        dt_.BumpUp(it, RelaxedBumpPolicy{});
+      if (use_bumps) {
+        RelaxedBumpPolicy policy;
+        dt_.BumpUp(it, policy);
+      }
+
       ++hits;
     }
   }
@@ -1117,7 +1191,8 @@ TEST_P(EvictionPolicyTest, HitRateZipfShr) {
         }
       } else {
         if (use_bumps) {
-          dt_.BumpUp(it, RelaxedBumpPolicy{});
+          RelaxedBumpPolicy policy;
+          dt_.BumpUp(it, policy);
           DVLOG(1) << "Bump up key " << key << " " << it.bucket_id() << " slot " << it.slot_id();
         } else {
           DVLOG(1) << "Hit on key " << key;

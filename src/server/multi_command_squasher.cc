@@ -6,6 +6,8 @@
 
 #include <absl/container/inlined_vector.h>
 
+#include "base/cycle_clock.h"
+#include "base/flags.h"
 #include "base/logging.h"
 #include "core/overloaded.h"
 #include "facade/dragonfly_connection.h"
@@ -14,6 +16,9 @@
 #include "server/engine_shard_set.h"
 #include "server/transaction.h"
 #include "server/tx_base.h"
+
+ABSL_FLAG(uint32_t, max_busy_squash_usec, 200,
+          "Maximum time in microseconds to execute squashed commands before yielding.");
 
 namespace dfly {
 
@@ -30,8 +35,8 @@ void CheckConnStateClean(const ConnectionState& state) {
   DCHECK(!state.subscribe_info);
 }
 
-size_t Size(const facade::CapturingReplyBuilder::Payload& payload) {
-  size_t payload_size = sizeof(facade::CapturingReplyBuilder::Payload);
+size_t Size(const CapturingReplyBuilder::Payload& payload) {
+  size_t payload_size = sizeof(CapturingReplyBuilder::Payload);
   return visit(
       Overloaded{
           [&](monostate) { return payload_size; },
@@ -62,24 +67,21 @@ size_t Size(const facade::CapturingReplyBuilder::Payload& payload) {
 
 }  // namespace
 
-atomic_uint64_t MultiCommandSquasher::current_reply_size_ = 0;
-
 MultiCommandSquasher::MultiCommandSquasher(absl::Span<StoredCmd> cmds, ConnectionContext* cntx,
-                                           Service* service, bool verify_commands, bool error_abort)
-    : cmds_{cmds},
-      cntx_{cntx},
-      service_{service},
-      base_cid_{nullptr},
-      verify_commands_{verify_commands},
-      error_abort_{error_abort} {
+                                           Service* service, const Opts& opts)
+    : cmds_{cmds}, cntx_{cntx}, service_{service}, base_cid_{nullptr}, opts_{opts} {
   auto mode = cntx->transaction->GetMultiMode();
   base_cid_ = cntx->transaction->GetCId();
   atomic_ = mode != Transaction::NON_ATOMIC;
 }
 
 MultiCommandSquasher::ShardExecInfo& MultiCommandSquasher::PrepareShardInfo(ShardId sid) {
-  if (sharded_.empty())
+  if (sharded_.empty()) {
     sharded_.resize(shard_set->size());
+    for (size_t i = 0; i < sharded_.size(); i++) {
+      sharded_[i].reply_size_total_ptr = &tl_facade_stats->reply_stats.squashing_current_reply_size;
+    }
+  }
 
   auto& sinfo = sharded_[sid];
   if (!sinfo.local_tx) {
@@ -97,7 +99,7 @@ MultiCommandSquasher::ShardExecInfo& MultiCommandSquasher::PrepareShardInfo(Shar
   return sinfo;
 }
 
-MultiCommandSquasher::SquashResult MultiCommandSquasher::TrySquash(StoredCmd* cmd) {
+MultiCommandSquasher::SquashResult MultiCommandSquasher::TrySquash(const StoredCmd* cmd) {
   DCHECK(cmd->Cid());
 
   if (!cmd->Cid()->IsTransactional() || (cmd->Cid()->opt_mask() & CO::BLOCKING) ||
@@ -108,8 +110,7 @@ MultiCommandSquasher::SquashResult MultiCommandSquasher::TrySquash(StoredCmd* cm
     return SquashResult::NOT_SQUASHED;
   }
 
-  cmd->Fill(&tmp_keylist_);
-  auto args = absl::MakeSpan(tmp_keylist_);
+  auto args = cmd->ArgList(&tmp_keylist_);
   if (args.empty())
     return SquashResult::NOT_SQUASHED;
 
@@ -119,7 +120,7 @@ MultiCommandSquasher::SquashResult MultiCommandSquasher::TrySquash(StoredCmd* cm
   if (keys->NumArgs() == 0)
     return SquashResult::NOT_SQUASHED;
 
-  // Check if all commands belong to one shard
+  // Check if all command keys belong to one shard
   ShardId last_sid = kInvalidSid;
 
   for (string_view key : keys->Range(args)) {
@@ -132,79 +133,85 @@ MultiCommandSquasher::SquashResult MultiCommandSquasher::TrySquash(StoredCmd* cm
 
   auto& sinfo = PrepareShardInfo(last_sid);
 
-  sinfo.cmds.push_back(cmd);
+  sinfo.dispatched.push_back({.cmd = cmd, .reply = {}});
   order_.push_back(last_sid);
 
   num_squashed_++;
 
-  // Because the squashed hop is currently blocking, we cannot add more than the max channel size,
-  // otherwise a deadlock occurs.
-  bool need_flush = sinfo.cmds.size() >= kMaxSquashing - 1;
+  bool need_flush = sinfo.dispatched.size() >= opts_.max_squash_size;
   return need_flush ? SquashResult::SQUASHED_FULL : SquashResult::SQUASHED;
 }
 
-bool MultiCommandSquasher::ExecuteStandalone(facade::RedisReplyBuilder* rb, StoredCmd* cmd) {
+bool MultiCommandSquasher::ExecuteStandalone(RedisReplyBuilder* rb, const StoredCmd* cmd) {
   DCHECK(order_.empty());  // check no squashed chain is interrupted
 
-  cmd->Fill(&tmp_keylist_);
-  auto args = absl::MakeSpan(tmp_keylist_);
+  auto args = cmd->ArgList(&tmp_keylist_);
 
-  if (verify_commands_) {
+  if (opts_.verify_commands) {
     if (auto err = service_->VerifyCommandState(cmd->Cid(), args, *cntx_); err) {
       rb->SendError(std::move(*err));
       rb->ConsumeLastError();
-      return !error_abort_;
+      return !opts_.error_abort;
     }
   }
 
   auto* tx = cntx_->transaction;
-  tx->MultiSwitchCmd(cmd->Cid());
-  cntx_->cid = cmd->Cid();
-
-  if (cmd->Cid()->IsTransactional())
-    tx->InitByArgs(cntx_->ns, cntx_->conn_state.db_index, args);
-  service_->InvokeCmd(cmd->Cid(), args, rb, cntx_);
-
+  if (cmd->Cid()->IsTransactional()) {
+    tx->MultiSwitchCmd(cmd->Cid());
+    auto status = tx->InitByArgs(cntx_->ns, cntx_->conn_state.db_index, args);
+    if (status != OpStatus::OK) {
+      rb->SendError(status);
+      rb->ConsumeLastError();
+      return !opts_.error_abort;
+    }
+  }
+  service_->InvokeCmd(cmd->Cid(), args, CommandContext{tx, rb, cntx_});
   return true;
 }
 
 OpStatus MultiCommandSquasher::SquashedHopCb(EngineShard* es, RespVersion resp_v) {
   auto& sinfo = sharded_[es->shard_id()];
-  DCHECK(!sinfo.cmds.empty());
+  DCHECK(!sinfo.dispatched.empty());
 
   auto* local_tx = sinfo.local_tx.get();
-  facade::CapturingReplyBuilder crb(ReplyMode::FULL, resp_v);
+  CapturingReplyBuilder crb(ReplyMode::FULL, resp_v);
   ConnectionContext local_cntx{cntx_, local_tx};
   if (cntx_->conn()) {
     local_cntx.skip_acl_validation = cntx_->conn()->IsPrivileged();
   }
-  absl::InlinedVector<MutableSlice, 4> arg_vec;
 
-  for (auto* cmd : sinfo.cmds) {
-    arg_vec.resize(cmd->NumArgs());
-    auto args = absl::MakeSpan(arg_vec);
-    cmd->Fill(args);
+  CmdArgVec arg_vec;
 
-    if (verify_commands_) {
+  auto move_reply = [&sinfo](CapturingReplyBuilder::Payload&& src,
+                             CapturingReplyBuilder::Payload* dst) {
+    *dst = std::move(src);
+    size_t sz = Size(*dst);
+    sinfo.reply_size_delta += sz;
+    sinfo.reply_size_total_ptr->fetch_add(sz, std::memory_order_relaxed);
+  };
+
+  for (auto& dispatched : sinfo.dispatched) {
+    auto args = dispatched.cmd->ArgList(&arg_vec);
+    if (opts_.verify_commands) {
       // The shared context is used for state verification, the local one is only for replies
-      if (auto err = service_->VerifyCommandState(cmd->Cid(), args, *cntx_); err) {
+      if (auto err = service_->VerifyCommandState(dispatched.cmd->Cid(), args, *cntx_); err) {
         crb.SendError(std::move(*err));
-        sinfo.replies.emplace_back(crb.Take());
-        current_reply_size_.fetch_add(Size(sinfo.replies.back()), std::memory_order_relaxed);
-
+        move_reply(crb.Take(), &dispatched.reply);
         continue;
       }
     }
 
-    local_tx->MultiSwitchCmd(cmd->Cid());
-    local_cntx.cid = cmd->Cid();
-    crb.SetReplyMode(cmd->ReplyMode());
+    crb.SetReplyMode(dispatched.cmd->ReplyMode());
 
-    local_tx->InitByArgs(cntx_->ns, local_cntx.conn_state.db_index, args);
-    service_->InvokeCmd(cmd->Cid(), args, &crb, &local_cntx);
-
-    sinfo.replies.emplace_back(crb.Take());
-    current_reply_size_.fetch_add(Size(sinfo.replies.back()), std::memory_order_relaxed);
+    local_tx->MultiSwitchCmd(dispatched.cmd->Cid());
+    auto status = local_tx->InitByArgs(cntx_->ns, local_cntx.conn_state.db_index, args);
+    if (status != OpStatus::OK) {
+      crb.SendError(status);
+    } else {
+      service_->InvokeCmd(dispatched.cmd->Cid(), args,
+                          CommandContext{local_cntx.transaction, &crb, &local_cntx});
+    }
+    move_reply(crb.Take(), &dispatched.reply);
 
     // Assert commands made no persistent state changes to stub context state
     const auto& local_state = local_cntx.conn_state;
@@ -212,7 +219,6 @@ OpStatus MultiCommandSquasher::SquashedHopCb(EngineShard* es, RespVersion resp_v
     CheckConnStateClean(local_state);
   }
 
-  reverse(sinfo.replies.begin(), sinfo.replies.end());
   return OpStatus::OK;
 }
 
@@ -224,8 +230,7 @@ bool MultiCommandSquasher::ExecuteSquashed(facade::RedisReplyBuilder* rb) {
 
   unsigned num_shards = 0;
   for (auto& sd : sharded_) {
-    sd.replies.reserve(sd.cmds.size());
-    if (!sd.cmds.empty())
+    if (!sd.dispatched.empty())
       ++num_shards;
   }
 
@@ -238,7 +243,7 @@ bool MultiCommandSquasher::ExecuteSquashed(facade::RedisReplyBuilder* rb) {
   // stubs, non-atomic ones just run the commands in parallel.
   if (IsAtomic()) {
     cntx_->cid = base_cid_;
-    auto cb = [this](ShardId sid) { return !sharded_[sid].cmds.empty(); };
+    auto cb = [this](ShardId sid) { return !sharded_[sid].dispatched.empty(); };
     tx->PrepareSquashedMultiHop(base_cid_, cb);
     tx->ScheduleSingleHop(
         [this, rb](auto* tx, auto* es) { return SquashedHopCb(es, rb->GetRespVersion()); });
@@ -246,13 +251,18 @@ bool MultiCommandSquasher::ExecuteSquashed(facade::RedisReplyBuilder* rb) {
     fb2::BlockingCounter bc(num_shards);
     DVLOG(1) << "Squashing " << num_shards << " " << tx->DebugId();
 
-    auto cb = [this, tx, bc, rb]() mutable {
+    static uint64_t tsc_cycles_limit =
+        base::CycleClock::Frequency() * absl::GetFlag(FLAGS_max_busy_squash_usec) / 1000'000;
+    auto cb = [this, bc, rb]() mutable {
+      if (ThisFiber::GetRunningTimeCycles() > tsc_cycles_limit) {
+        ThisFiber::Yield();
+      }
       this->SquashedHopCb(EngineShard::tlocal(), rb->GetRespVersion());
       bc->Dec();
     };
 
     for (unsigned i = 0; i < sharded_.size(); ++i) {
-      if (!sharded_[i].cmds.empty())
+      if (!sharded_[i].dispatched.empty())
         shard_set->AddL2(i, cb);
     }
     bc->Wait();
@@ -261,25 +271,35 @@ bool MultiCommandSquasher::ExecuteSquashed(facade::RedisReplyBuilder* rb) {
   uint64_t after_hop = proactor->GetMonotonicTimeNs();
   bool aborted = false;
 
+  ServerState* fresh_ss = ServerState::SafeTLocal();
+
+  size_t total_reply_size = 0;
+  for (auto& sinfo : sharded_) {
+    total_reply_size += sinfo.reply_size_delta;
+  }
+
   for (auto idx : order_) {
-    auto& replies = sharded_[idx].replies;
-    CHECK(!replies.empty());
+    auto& sinfo = sharded_[idx];
+    DCHECK_LT(sinfo.reply_id, sinfo.dispatched.size());
 
-    aborted |= error_abort_ && CapturingReplyBuilder::TryExtractError(replies.back());
+    auto& reply = sinfo.dispatched[sinfo.reply_id++].reply;
+    aborted |= opts_.error_abort && CapturingReplyBuilder::TryExtractError(reply);
 
-    current_reply_size_.fetch_sub(Size(replies.back()), std::memory_order_relaxed);
-    CapturingReplyBuilder::Apply(std::move(replies.back()), rb);
-    replies.pop_back();
-
+    CapturingReplyBuilder::Apply(std::move(reply), rb);
     if (aborted)
       break;
   }
   uint64_t after_reply = proactor->GetMonotonicTimeNs();
-  ServerState::SafeTLocal()->stats.multi_squash_exec_hop_usec += (after_hop - start) / 1000;
-  ServerState::SafeTLocal()->stats.multi_squash_exec_reply_usec += (after_reply - after_hop) / 1000;
+  fresh_ss->stats.multi_squash_exec_hop_usec += (after_hop - start) / 1000;
+  fresh_ss->stats.multi_squash_exec_reply_usec += (after_reply - after_hop) / 1000;
 
-  for (auto& sinfo : sharded_)
-    sinfo.cmds.clear();
+  tl_facade_stats->reply_stats.squashing_current_reply_size.fetch_sub(total_reply_size,
+                                                                      std::memory_order_release);
+
+  for (auto& sinfo : sharded_) {
+    sinfo.dispatched.clear();
+    sinfo.reply_id = 0;
+  }
 
   order_.clear();
   return !aborted;
@@ -298,11 +318,12 @@ size_t MultiCommandSquasher::Run(RedisReplyBuilder* rb) {
     if (res == SquashResult::NOT_SQUASHED || res == SquashResult::SQUASHED_FULL) {
       if (!ExecuteSquashed(rb))
         break;
-    }
 
-    if (res == SquashResult::NOT_SQUASHED) {
-      if (!ExecuteStandalone(rb, &cmd))
-        break;
+      // if the last command was not added - we squash it separately.
+      if (res == SquashResult::NOT_SQUASHED) {
+        if (!ExecuteStandalone(rb, &cmd))
+          break;
+      }
     }
   }
 

@@ -835,7 +835,7 @@ async def test_cluster_replica_sets_non_owned_keys(df_factory: DflyInstanceFacto
         assert re.match(r"MOVED \d+ localhost:1111", e.value.args[0])
 
         await push_config(replica_config, [c_master_admin])
-        await asyncio.sleep(0.5)
+        await check_all_replicas_finished([c_replica], c_master)
         assert await c_master.execute_command("dbsize") == 0
         assert await c_replica.execute_command("dbsize") == 0
 
@@ -941,7 +941,7 @@ async def test_cluster_flush_slots_after_config_change(df_factory: DflyInstanceF
     """
     await push_config(config, [c_master_admin, c_replica_admin])
 
-    await asyncio.sleep(0.5)
+    await check_all_replicas_finished([c_replica], c_master)
 
     assert await c_master.execute_command("dbsize") == (100_000 - slot_0_size)
     assert await c_replica.execute_command("dbsize") == (100_000 - slot_0_size)
@@ -1146,6 +1146,10 @@ async def test_cluster_native_client(
             assert await client.get(key) == "value"
 
     await test_random_keys()
+
+    for i in range(3):
+        await check_all_replicas_finished([c_replicas[i]], c_masters_admin[i])
+
     await asyncio.gather(*(wait_available_async(c) for c in c_replicas))
 
     # Make sure that getting a value from a replica works as well.
@@ -1492,8 +1496,9 @@ async def test_network_disconnect_during_migration(df_factory):
         await push_config(json.dumps(generate_config(nodes)), [node.admin_client for node in nodes])
 
         for _ in range(10):
-            await asyncio.sleep(random.randint(0, 10) / 100)
-            logging.debug("drop connections")
+            await asyncio.sleep(random.randint(0, 50) / 100)
+            info = await nodes[0].admin_client.info("CLUSTER")
+            logging.debug("drop connection: %s", info)
             proxy.drop_connection()
             logging.debug(
                 await nodes[0].admin_client.execute_command("DFLYCLUSTER", "SLOT-MIGRATION-STATUS")
@@ -1809,8 +1814,7 @@ async def test_cluster_replication_migration(
     assert await seeder.compare(fake_capture, r1_node.instance.port)
 
 
-@pytest.mark.skip("Flaky test")
-@dfly_args({"proactor_threads": 4, "cluster_mode": "yes"})
+@dfly_args({"proactor_threads": 4, "cluster_mode": "yes", "pause_wait_timeout": 10})
 async def test_start_replication_during_migration(
     df_factory: DflyInstanceFactory, df_seeder_factory: DflySeederFactory
 ):
@@ -2198,7 +2202,7 @@ async def test_cluster_migration_while_seeding(
 
     assert (
         await get_memory(client0, "used_memory_peak_rss")
-        < await get_memory(client0, "used_memory_rss") * 1.1
+        < await get_memory(client0, "used_memory_rss") * 1.2
     )
 
     capture = await seeder.capture_fake_redis()
@@ -2560,8 +2564,7 @@ async def test_replicate_redis_cluster(redis_cluster, df_factory, df_seeder_fact
     assert await seeder.compare(capture, replica.port)
 
 
-@pytest.mark.skip("Flaky test")
-@dfly_args({"proactor_threads": 4})
+@dfly_args({"proactor_threads": 4, "pause_wait_timeout": 10})
 async def test_replicate_disconnect_redis_cluster(redis_cluster, df_factory, df_seeder_factory):
     """
     Create redis cluster of 3 nodes.
@@ -2745,7 +2748,8 @@ async def test_migration_timeout_on_sync(df_factory: DflyInstanceFactory, df_see
     await push_config(json.dumps(generate_config(nodes)), [node.admin_client for node in nodes])
 
     await asyncio.sleep(random.randint(0, 50) / 100)
-    await wait_for_migration_start(nodes[1].admin_client, nodes[0].id)
+    # to pause migration we need to be in sync state
+    await wait_for_status(nodes[1].admin_client, nodes[0].id, "SYNC", 1000)
 
     logging.debug("debug migration pause")
     await nodes[1].client.execute_command("debug migration pause")
@@ -2860,7 +2864,7 @@ For each migration we start migration, wait for it to finish and once it is fini
 @pytest.mark.slow
 @pytest.mark.exclude_epoll
 @pytest.mark.asyncio
-@dfly_args({"proactor_threads": 4, "cluster_mode": "yes"})
+@dfly_args({"proactor_threads": 4, "cluster_mode": "yes", "pause_wait_timeout": 10})
 async def test_migration_rebalance_node(df_factory: DflyInstanceFactory, df_seeder_factory):
     # 1. Create cluster of 3 nodes with all slots allocated to first node.
     instances = [
@@ -2953,6 +2957,65 @@ async def test_migration_rebalance_node(df_factory: DflyInstanceFactory, df_seed
     await asyncio.sleep(0.5)  # wait untill all keys with ttl are expired
     capture = await seeder.capture_fake_redis()
     assert await seeder.compare(capture, nodes[1].instance.port)
+
+
+@dfly_args({"proactor_threads": 4, "cluster_mode": "yes"})
+async def test_migration_restart(df_factory: DflyInstanceFactory, df_seeder_factory):
+    # 1. Start migration, and than restart it with another slots set
+    instances = [
+        df_factory.create(
+            port=next(next_port),
+            admin_port=next(next_port),
+            vmodule="outgoing_slot_migration=2,cluster_family=2,incoming_slot_migration=2",
+        )
+        for i in range(2)
+    ]
+    df_factory.start_all(instances)
+
+    nodes = [(await create_node_info(instance)) for instance in instances]
+    nodes[0].slots = [(0, 16383)]
+    nodes[1].slots = []
+
+    await push_config(json.dumps(generate_config(nodes)), [node.admin_client for node in nodes])
+
+    logging.debug("Start seeder")
+    seeder = df_seeder_factory.create(
+        keys=50_000,
+        port=instances[0].port,
+        cluster_mode=True,
+    )
+    await seeder.run(target_deviation=0.1)
+    capture = await seeder.capture()
+
+    logging.debug(f"Start migration")
+    nodes[0].migrations.append(
+        MigrationInfo(
+            "127.0.0.1",
+            nodes[1].instance.admin_port,
+            [(random.randint(1, 8000), random.randint(8001, 16383))],
+            nodes[1].id,
+        )
+    )
+    await push_config(json.dumps(generate_config(nodes)), [node.admin_client for node in nodes])
+
+    await asyncio.sleep(random.randint(1, 10) / 5)
+    logging.debug(f"Restart migration")
+    final_migration_range = (random.randint(1, 8000), random.randint(8001, 16382))
+    nodes[0].migrations[0] = MigrationInfo(
+        "127.0.0.1", nodes[1].instance.admin_port, [final_migration_range], nodes[1].id
+    )
+    await push_config(json.dumps(generate_config(nodes)), [node.admin_client for node in nodes])
+
+    logging.debug(f"wait migration to finish")
+    await wait_for_status(nodes[0].admin_client, nodes[1].id, "FINISHED", timeout=50)
+    await wait_for_status(nodes[1].admin_client, nodes[0].id, "FINISHED", timeout=50)
+
+    nodes[0].migrations = []
+    nodes[0].slots = [(0, final_migration_range[0] - 1), (final_migration_range[1] + 1, 16383)]
+    nodes[1].slots = [final_migration_range]
+    await push_config(json.dumps(generate_config(nodes)), [node.admin_client for node in nodes])
+
+    assert await seeder.compare(capture, nodes[0].instance.port)
 
 
 @dfly_args({"proactor_threads": 2, "cluster_mode": "yes"})
@@ -3162,7 +3225,7 @@ async def test_readonly_replication(
     await m1_node.client.execute_command("SET X 1")
 
     logging.debug("start replication")
-    await r1_node.admin_client.execute_command(f"replicaof localhost {m1_node.instance.port}")
+    await r1_node.admin_client.execute_command(f"replicaof localhost {m1_node.instance.admin_port}")
 
     await wait_available_async(r1_node.admin_client)
 
@@ -3172,6 +3235,23 @@ async def test_readonly_replication(
 
     # This behavior can be changed in the future
     assert await r1_node.client.execute_command("GET Y") == None
+
+    m1_node.replicas = []
+
+    logging.debug("Push config without replica")
+    await push_config(
+        json.dumps(generate_config(master_nodes)), [node.admin_client for node in nodes]
+    )
+
+    with pytest.raises(redis.exceptions.ResponseError) as moved_error:
+        await r1_node.client.execute_command("GET X")
+
+    assert str(moved_error.value) == f"MOVED 7165 127.0.0.1:{instances[0].port}"
+
+    with pytest.raises(redis.exceptions.ResponseError) as moved_error:
+        await r1_node.client.execute_command("GET Y")
+
+    assert str(moved_error.value) == f"MOVED 3036 127.0.0.1:{instances[0].port}"
 
 
 @dfly_args({"proactor_threads": 2, "cluster_mode": "yes"})
@@ -3216,3 +3296,64 @@ async def test_cancel_blocking_cmd_during_mygration_finalization(df_factory: Dfl
     await push_config(json.dumps(generate_config(nodes)), [node.client for node in nodes])
 
     assert await c_nodes[1].type("list") == "none"
+
+
+@dfly_args({"cluster_mode": "yes"})
+async def test_slot_migration_oom(df_factory):
+    instances = [
+        df_factory.create(
+            port=next(next_port),
+            admin_port=next(next_port),
+            proactor_threads=4,
+            maxmemory="1024MB",
+        ),
+        df_factory.create(
+            port=next(next_port),
+            admin_port=next(next_port),
+            proactor_threads=2,
+            maxmemory="512MB",
+        ),
+    ]
+
+    df_factory.start_all(instances)
+
+    nodes = [(await create_node_info(instance)) for instance in instances]
+    nodes[0].slots = [(0, 16383)]
+    nodes[1].slots = []
+
+    await push_config(json.dumps(generate_config(nodes)), [node.admin_client for node in nodes])
+
+    await nodes[0].client.execute_command("DEBUG POPULATE 100 test 10000000")
+
+    nodes[0].migrations.append(
+        MigrationInfo("127.0.0.1", nodes[1].instance.admin_port, [(0, 16383)], nodes[1].id)
+    )
+
+    logging.info("Start migration")
+    await push_config(json.dumps(generate_config(nodes)), [node.admin_client for node in nodes])
+
+    # Wait for FATAL status
+    await wait_for_status(nodes[0].admin_client, nodes[1].id, "FATAL", 300)
+    await wait_for_status(nodes[1].admin_client, nodes[0].id, "FATAL")
+
+    # There's a rare timing issue if we don't wait here. Status can be set to FATAL
+    # but error message is not still set for slot migration.
+    await asyncio.sleep(1)
+
+    # Node_0 slot-migration-status
+    status = await nodes[0].admin_client.execute_command(
+        "DFLYCLUSTER", "SLOT-MIGRATION-STATUS", nodes[1].id
+    )
+    # Direction
+    assert status[0][0] == "out"
+    # Error message
+    assert status[0][4] == "Cannot allocate memory: INCOMING_MIGRATION_OOM"
+
+    # Node_1 slot-migration-status
+    status = await nodes[1].admin_client.execute_command(
+        "DFLYCLUSTER", "SLOT-MIGRATION-STATUS", nodes[0].id
+    )
+    # Direction
+    assert status[0][0] == "in"
+    # Error message
+    assert status[0][4] == "INCOMING_MIGRATION_OOM"

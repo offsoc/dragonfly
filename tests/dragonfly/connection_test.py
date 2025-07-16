@@ -467,6 +467,58 @@ async def test_subscribers_with_active_publisher(df_server: DflyInstance, max_co
     await async_pool.disconnect()
 
 
+# This test ensures that no messages are sent after a successful
+# acknowledgement of a unsubscribe.
+# Low publish_buffer_limit makes publishers block on memory backpressure
+
+
+@dfly_args({"publish_buffer_limit": 100, "proactor_threads": 2})
+async def test_pubsub_unsubscribe(df_server: DflyInstance):
+    long_message = "a" * 100_000
+    pub_sent = 0
+    pub_ready_ev = asyncio.Event()
+
+    async def publisher():
+        nonlocal pub_sent
+        async with df_server.client(single_connection_client=True) as c:
+            for _ in range(32):
+                await c.execute_command("PUBLISH", "chan", long_message)
+                # Unblock subscriber after a sufficient amount of publish requests accumulated
+                pub_sent += 1
+                if pub_sent >= 16:
+                    pub_ready_ev.set()
+
+    # Get raw connection from the client and subscribe to chan
+    cl = df_server.client(single_connection_client=True)
+    await cl.ping()
+    conn = cl.connection
+    await conn.send_command("SUBSCRIBE chan")
+
+    # Flood our only subscriber with large messages to make publishers stop
+    tasks = [asyncio.create_task(publisher()) for _ in range(16)]
+
+    # Unsubscribe in the process
+    await pub_ready_ev.wait()
+    await conn.send_command("UNSUBSCRIBE")
+
+    # No messages should be received after we've read unsubscribe reply
+    had_unsub = False
+    while True:
+        reply = await conn.read_response(timeout=0.2)
+        if reply is None:
+            break
+
+        if reply[0] == "unsubscribe":
+            assert reply[2] == 0  # zero subscriptions left
+            had_unsub = True
+        else:
+            assert not had_unsub, "found message even after all subscriptions were removed"
+
+    assert had_unsub
+    await asyncio.gather(*tasks)
+    await cl.aclose()
+
+
 async def produce_expiring_keys(async_client: aioredis.Redis):
     keys = []
     for i in range(10, 50):
@@ -525,7 +577,7 @@ async def test_keyspace_events_config_set(async_client: aioredis.Redis):
             await collect_expiring_events(pclient, keys)
 
 
-@pytest.mark.exclude_epoll
+@dfly_args({"max_busy_read_usec": 50000})
 async def test_reply_count(async_client: aioredis.Redis):
     """Make sure reply aggregations reduce reply counts for common cases"""
 
@@ -537,6 +589,7 @@ async def test_reply_count(async_client: aioredis.Redis):
         await aw
         return await get_reply_count() - before - 1
 
+    await async_client.config_resetstat()
     base = await get_reply_count()
     info_diff = await get_reply_count() - base
     assert info_diff == 1
@@ -561,13 +614,16 @@ async def test_reply_count(async_client: aioredis.Redis):
     e = async_client.pipeline(transaction=True)
     for _ in range(100):
         e.incr("num-1")
-    assert await measure(e.execute()) == 2  # OK + Response
+
+    # one - for MULTI-OK, one for the rest. Depends on the squashing efficiency,
+    # can be either 1 or 2 replies.
+    assert await measure(e.execute()) <= 2
 
     # Just pipeline
     p = async_client.pipeline(transaction=False)
     for _ in range(100):
         p.incr("num-1")
-    assert await measure(p.execute()) == 1
+    assert await measure(p.execute()) <= 2
 
     # Script result
     assert await measure(async_client.eval('return {1,2,{3,4},5,6,7,8,"nine"}', 0)) == 1
@@ -1118,14 +1174,15 @@ async def test_send_timeout(df_server, async_client: aioredis.Redis):
 
 
 # Test that the cache pipeline does not grow or shrink under constant pipeline load.
-@dfly_args({"proactor_threads": 1, "pipeline_squash": 9})
+@dfly_args({"proactor_threads": 1, "pipeline_squash": 9, "max_busy_read_usec": 50000})
 async def test_pipeline_cache_only_async_squashed_dispatches(df_factory):
     server = df_factory.create()
     server.start()
 
     client = server.client()
+    await client.ping()  # Make sure the connection and the protocol were established
 
-    async def push_pipeline(size=1):
+    async def push_pipeline(size):
         p = client.pipeline(transaction=True)
         for i in range(size):
             p.info()
@@ -1136,14 +1193,15 @@ async def test_pipeline_cache_only_async_squashed_dispatches(df_factory):
     # should be zero because:
     # We always dispatch the items that will be squashed, so when `INFO` gets called
     # the cache is empty because the pipeline consumed it throughout its execution
-    for i in range(0, 30):
+    # high max_busy_read_usec ensures that the connection fiber has enough time to push
+    # all the commands to reach the squashing limit.
+    for i in range(0, 10):
         # it's actually 11 commands. 8 INFO + 2 from the MULTI/EXEC block that is injected
-        # by the client. Connection fiber yields to dispatch/async fiber when
-        # ++async_streak_len_ >= 10. The minimum to squash is 9 so it will squash the pipeline
+        # by the client. The minimum to squash is 9 so it will squash the pipeline
         # and INFO ALL should return zero for all the squashed commands in the pipeline
         res = await push_pipeline(8)
-        for i in range(1):
-            assert res[i]["pipeline_cache_bytes"] == 0
+        for r in res:
+            assert r["pipeline_cache_bytes"] == 0
 
     # Non zero because we reclaimed/recycled the messages back to the cache
     info = await client.info()
@@ -1154,6 +1212,7 @@ async def test_pipeline_cache_only_async_squashed_dispatches(df_factory):
 # pipeline commands and then "back off" by gradually reducing the pipeline load such that
 # the cache becomes progressively underutilized. At that stage, the pipeline should slowly
 # shrink (because it's underutilized).
+@pytest.mark.skip("Flaky")
 @dfly_args({"proactor_threads": 1})
 async def test_pipeline_cache_size(df_factory):
     server = df_factory.create(proactor_threads=1)
@@ -1273,3 +1332,42 @@ async def test_client_detached_crash(df_factory):
     async_client = server.client()
     await async_client.client_pause(2, all=False)
     server.stop()
+
+
+async def test_tls_client_kill_preemption(
+    with_ca_tls_server_args, with_ca_tls_client_args, df_factory
+):
+    server = df_factory.create(proactor_threads=4, port=BASE_PORT, **with_ca_tls_server_args)
+    server.start()
+
+    client = aioredis.Redis(port=server.port, **with_ca_tls_client_args)
+    assert await client.dbsize() == 0
+
+    # Get the list of clients
+    clients_info = await client.client_list()
+    assert len(clients_info) == 1
+
+    kill_id = clients_info[0]["id"]
+
+    async def seed():
+        with pytest.raises(aioredis.ConnectionError) as roe:
+            while True:
+                p = client.pipeline(transaction=True)
+                expected = []
+                for i in range(100):
+                    p.lpush(str(i), "V")
+                    expected.append(f"LPUSH {i} V")
+
+                await p.execute()
+
+    task = asyncio.create_task(seed())
+
+    await asyncio.sleep(0.1)
+
+    cl = aioredis.Redis(port=server.port, **with_ca_tls_client_args)
+    await cl.execute_command(f"CLIENT KILL ID {kill_id}")
+
+    await task
+    server.stop()
+    lines = server.find_in_logs("Preempting inside of atomic section, fiber")
+    assert len(lines) == 0

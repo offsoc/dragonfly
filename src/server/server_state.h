@@ -133,7 +133,7 @@ class ServerState {  // public struct - to allow initialization.
     // Number of times we rejected command dispatch due to OOM condition.
     uint64_t oom_error_cmd_cnt = 0;
     uint32_t conn_timeout_events = 0;
-
+    uint64_t psync_requests_total = 0;
     std::valarray<uint64_t> tx_width_freq_arr;
   };
 
@@ -274,6 +274,7 @@ class ServerState {  // public struct - to allow initialization.
 
   bool is_master = true;
   uint32_t log_slower_than_usec = UINT32_MAX;
+  uint32_t max_squash_cmd_num = 32;
 
   acl::UserRegistry* user_registry;
 

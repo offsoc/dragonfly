@@ -115,6 +115,8 @@ TEST_F(SetFamilyTest, SInter) {
   EXPECT_THAT(resp, ErrArg("WRONGTYPE Operation against a key"));
   resp = Run({"sinterstore", "none1", "none2"});
   EXPECT_THAT(resp, IntArg(0));
+
+  EXPECT_THAT(Run({"sinter"}), ErrArg("wrong number of arguments"));
 }
 
 TEST_F(SetFamilyTest, SInterCard) {
@@ -178,6 +180,21 @@ TEST_F(SetFamilyTest, SPop) {
   resp = Run({"smembers", "y"});
   ASSERT_THAT(resp, ArrLen(2));
   EXPECT_THAT(resp.GetVec(), IsSubsetOf({"a", "b", "c"}));
+
+  // Test POP on large set with small pop count
+  vector<string> xlarge{"sadd", "xlarge"};
+  for (size_t i = 0; i < 100; i++)
+    xlarge.push_back(to_string(i));
+  Run(absl::MakeSpan(xlarge));
+
+  resp = Run({"spop", "xlarge", "2"});
+  {
+    auto elems = resp.GetVec();
+    EXPECT_NE(elems[0].GetString(), elems[1].GetString());
+  }
+
+  resp = Run({"scard", "xlarge"});
+  EXPECT_THAT(resp, IntArg(98));
 }
 
 TEST_F(SetFamilyTest, SRandMember) {
@@ -410,6 +427,19 @@ TEST_F(SetFamilyTest, SAddEx) {
 
   // At least one arg is expected
   EXPECT_THAT(Run({"saddex", "key", "KEEPTTL", "2"}), ErrArg("wrong number of arguments"));
+}
+
+TEST_F(SetFamilyTest, CheckSetLinkExpiryTransfer) {
+  for (int i = 0; i < 10; i++) {
+    EXPECT_THAT(Run({"SADDEX", "key", "5", absl::StrCat(i)}), IntArg(1));
+  }
+  for (int i = 0; i < 9; i++) {
+    Run({"SREM", "key", absl::StrCat(i)});
+  }
+  EXPECT_THAT(Run({"SCARD", "key"}), IntArg(1));
+  AdvanceTime(6000);
+  Run({"SMEMBERS", "key"});
+  EXPECT_THAT(Run({"SCARD", "key"}), IntArg(0));
 }
 
 }  // namespace dfly

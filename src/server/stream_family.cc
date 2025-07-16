@@ -679,7 +679,7 @@ OpResult<streamID> OpAdd(const OpArgs& op_args, string_view key, const AddOpts& 
     RETURN_ON_BAD_STATUS(res_it);
     add_res = std::move(*res_it);
   } else {
-    auto op_res = db_slice.AddOrFind(op_args.db_cntx, key);
+    auto op_res = db_slice.AddOrFind(op_args.db_cntx, key, OBJ_STREAM);
     RETURN_ON_BAD_STATUS(op_res);
     add_res = std::move(*op_res);
   }
@@ -691,8 +691,6 @@ OpResult<streamID> OpAdd(const OpArgs& op_args, string_view key, const AddOpts& 
   if (add_res.is_new) {
     stream* s = streamNew();
     it->second.InitRobj(OBJ_STREAM, OBJ_ENCODING_STREAM, s);
-  } else if (it->second.ObjType() != OBJ_STREAM) {
-    return OpStatus::WRONG_TYPE;
   }
 
   stream* stream_inst = (stream*)it->second.RObjPtr();
@@ -2138,7 +2136,7 @@ struct StreamReplies {
   }
 
   void SendRecord(const Record& record) const {
-    rb->StartArray(2);
+    RedisReplyBuilder::ArrayScope scope{rb, 2};
     rb->SendBulkString(StreamIdRepr(record.id));
     rb->StartArray(record.kv_arr.size() * 2);
     for (const auto& k_v : record.kv_arr) {
@@ -2148,13 +2146,13 @@ struct StreamReplies {
   }
 
   void SendIDs(absl::Span<const streamID> ids) const {
-    rb->StartArray(ids.size());
+    RedisReplyBuilder::ArrayScope scope{rb, ids.size()};
     for (auto id : ids)
       rb->SendBulkString(StreamIdRepr(id));
   }
 
   void SendRecords(absl::Span<const Record> records) const {
-    rb->StartArray(records.size());
+    RedisReplyBuilder::ArrayScope scope{rb, records.size()};
     for (const auto& record : records)
       SendRecord(record);
   }
@@ -2330,7 +2328,7 @@ void XRangeGeneric(std::string_view key, std::string_view start, std::string_vie
     return builder->SendError("invalid end ID for the interval", kSyntaxErrType);
   }
 
-  if (args.size() > 0) {
+  if (!args.empty()) {
     if (args.size() != 2) {
       return builder->SendError(WrongNumArgsError("XRANGE"), kSyntaxErrType);
     }
@@ -2562,7 +2560,7 @@ void XReadGeneric2(CmdArgList args, bool read_group, Transaction* tx, SinkReplyB
 
   // Send all results back
   auto* rb = static_cast<RedisReplyBuilder*>(builder);
-  SinkReplyBuilder::ReplyAggregator agg(builder);
+  SinkReplyBuilder::ReplyScope scope(builder);
   if (opts->read_group) {
     if (rb->IsResp3()) {
       rb->StartCollection(opts->stream_ids.size(), RedisReplyBuilder::CollectionType::MAP);
@@ -2800,6 +2798,11 @@ void StreamFamily::XClaim(CmdArgList args, const CommandContext& cmd_cntx) {
   };
   OpResult<ClaimInfo> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
   if (!result) {
+    if (result.status() == OpStatus::SKIPPED) {
+      // Return empty result when operation is skipped
+      StreamReplies{cmd_cntx.rb}.SendClaimInfo(ClaimInfo{});
+      return;
+    }
     cmd_cntx.rb->SendError(result.status());
     return;
   }
@@ -3139,6 +3142,7 @@ void StreamFamily::XPending(CmdArgList args, const CommandContext& cmd_cntx) {
   }
   const PendingResult& result = op_result.value();
 
+  SinkReplyBuilder::ReplyScope scope{rb};
   if (std::holds_alternative<PendingReducedResult>(result)) {
     const auto& res = std::get<PendingReducedResult>(result);
     rb->StartArray(4);
@@ -3289,8 +3293,9 @@ void StreamFamily::XTrim(CmdArgList args, const CommandContext& cmd_cntx) {
   std::string_view key = parser.Next();
 
   auto parsed_trim_opts = ParseTrimOpts(&parser);
-  if (!parsed_trim_opts || !parser.Finalize()) {
-    rb->SendError(!parsed_trim_opts ? parsed_trim_opts.error() : parser.Error()->MakeReply());
+  if (!parser.Finalize() || !parsed_trim_opts) {
+    auto err = parser.Error();
+    rb->SendError(!parsed_trim_opts ? parsed_trim_opts.error() : err->MakeReply());
     return;
   }
 

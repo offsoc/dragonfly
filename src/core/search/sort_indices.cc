@@ -29,7 +29,8 @@ template <typename T> bool SimpleValueSortIndex<T>::ParsedSortValue::IsNullValue
 }
 
 template <typename T>
-SimpleValueSortIndex<T>::SimpleValueSortIndex(PMR_NS::memory_resource* mr) : values_{mr} {
+SimpleValueSortIndex<T>::SimpleValueSortIndex(PMR_NS::memory_resource* mr)
+    : values_{mr}, null_values_(mr) {
 }
 
 template <typename T> SortableValue SimpleValueSortIndex<T>::Lookup(DocId doc) const {
@@ -46,16 +47,18 @@ template <typename T> SortableValue SimpleValueSortIndex<T>::Lookup(DocId doc) c
 }
 
 template <typename T>
-std::vector<ResultScore> SimpleValueSortIndex<T>::Sort(std::vector<DocId>* ids, size_t limit,
-                                                       bool desc) const {
+std::vector<SortableValue> SimpleValueSortIndex<T>::Sort(std::vector<DocId>* ids, size_t limit,
+                                                         bool desc) const {
   auto cb = [this, desc](const auto& lhs, const auto& rhs) {
     return desc ? (values_[lhs] > values_[rhs]) : (values_[lhs] < values_[rhs]);
   };
   std::partial_sort(ids->begin(), ids->begin() + std::min(ids->size(), limit), ids->end(), cb);
 
-  vector<ResultScore> out(min(ids->size(), limit));
+  // Turn PMR string into std::string
+  using ScoreT = std::conditional_t<is_same_v<T, PMR_NS::string>, std::string, T>;
+  vector<SortableValue> out(min(ids->size(), limit));
   for (size_t i = 0; i < out.size(); i++)
-    out[i] = values_[(*ids)[i]];
+    out[i] = ScoreT{values_[(*ids)[i]]};
   return out;
 }
 
@@ -88,6 +91,23 @@ void SimpleValueSortIndex<T>::Remove(DocId id, const DocumentAccessor& doc,
 
   DCHECK_LT(id, values_.size());
   values_[id] = T{};
+}
+
+template <typename T>
+std::vector<DocId> SimpleValueSortIndex<T>::GetAllDocsWithNonNullValues() const {
+  std::vector<DocId> result;
+  result.reserve(values_.size());
+
+  auto empty_value = T{};
+  for (DocId id = 0; id < values_.size(); ++id) {
+    if (values_[id] != empty_value) {
+      result.push_back(id);
+    }
+  }
+
+  // Result is already sorted by DocId
+  // Also it has no duplicates
+  return result;
 }
 
 template <typename T> PMR_NS::memory_resource* SimpleValueSortIndex<T>::GetMemRes() const {

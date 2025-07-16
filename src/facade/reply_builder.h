@@ -90,7 +90,7 @@ class SinkReplyBuilder {
   }
 
   bool IsSendActive() const {
-    return send_active_;
+    return send_time_ns_ > 0;
   }
 
   void SetBatchMode(bool b) {
@@ -124,6 +124,8 @@ class SinkReplyBuilder {
     return std::exchange(last_error_, {});
   }
 
+  uint64_t GetLastSendTimeNs() const;
+
  protected:
   template <typename... Ts>
   void WritePieces(Ts&&... pieces);     // Copy pieces into buffer and reference buffer
@@ -140,7 +142,6 @@ class SinkReplyBuilder {
   io::Sink* sink_;
   std::error_code ec_;
 
-  bool send_active_ = false;  // set while Send() is suspended on socket write
   bool scoped_ = false, batched_ = false;
 
   size_t total_size_ = 0;  // sum of vec_ lengths
@@ -151,6 +152,7 @@ class SinkReplyBuilder {
   // lifetime ends or copies refs to the buffer.
   absl::InlinedVector<iovec, 16> vecs_;
   size_t guaranteed_pieces_ = 0;  // length of prefix of vecs_ that are guaranteed to be pieces
+  uint64_t send_time_ns_ = 0;
 };
 
 class MCReplyBuilder : public SinkReplyBuilder {
@@ -175,7 +177,8 @@ class MCReplyBuilder : public SinkReplyBuilder {
   void SendDeleted();
   void SendGetEnd();
 
-  void SendValue(std::string_view key, std::string_view value, uint64_t mc_ver, uint32_t mc_flag);
+  void SendValue(std::string_view key, std::string_view value, uint64_t mc_ver, uint32_t mc_flag,
+                 bool send_cas_token);
   void SendSimpleString(std::string_view str) final;
   void SendProtocolError(std::string_view str) final;
 
@@ -285,8 +288,17 @@ class RedisReplyBuilder : public RedisReplyBuilderBase {
 
   ~RedisReplyBuilder() override = default;
 
+  // One-liner for ReplyScope + StartArray
+  struct ArrayScope : ReplyScope {
+    ArrayScope(RedisReplyBuilder* rb, size_t len) : ReplyScope(rb) {
+      rb->StartArray(len);
+    }
+  };
+
   void SendSimpleStrArr(const facade::ArgRange& strs);
   void SendBulkStrArr(const facade::ArgRange& strs, CollectionType ct = ARRAY);
+  template <typename I> void SendLongArr(absl::Span<const I> longs);
+
   void SendScoredArray(ScoredArray arr, bool with_scores);
   void SendLabeledScoredArray(std::string_view arr_label, ScoredArray arr);
   void SendStored() final;

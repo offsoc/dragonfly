@@ -30,8 +30,11 @@ struct DbStats : public DbTableStats {
   // number of keys that have expiry deadline.
   size_t expire_count = 0;
 
-  // number of buckets in dictionary (key capacity)
-  size_t bucket_count = 0;
+  // total number of slots in prime dictionary (key capacity).
+  size_t prime_capacity = 0;
+
+  // total number of slots in prime dictionary (key capacity).
+  size_t expire_capacity = 0;
 
   // Memory used by dictionaries.
   size_t table_mem_usage = 0;
@@ -69,6 +72,8 @@ struct SliceEvents {
 
   // how many updates and insertions of keys between snapshot intervals
   size_t update = 0;
+
+  uint64_t huff_encode_total = 0, huff_encode_success = 0;
 
   SliceEvents& operator+=(const SliceEvents& o);
 };
@@ -147,25 +152,24 @@ class DbSlice {
     AutoUpdater();
     AutoUpdater(const AutoUpdater& o) = delete;
     AutoUpdater& operator=(const AutoUpdater& o) = delete;
-    AutoUpdater(AutoUpdater&& o);
+    AutoUpdater(AutoUpdater&& o) noexcept;
     AutoUpdater& operator=(AutoUpdater&& o);
     ~AutoUpdater();
+
+    // Removes the memory usage attributed to the iterator and resets orig_heap_size.
+    // Used when the existing object is overridden by a new one.
+    void ReduceHeapUsage();
 
     void Run();
     void Cancel();
 
    private:
-    enum class DestructorAction {
-      kDoNothing,
-      kRun,
-    };
-
     // Wrap members in a struct to auto generate operator=
     struct Fields {
-      DestructorAction action = DestructorAction::kDoNothing;
-
       DbSlice* db_slice = nullptr;
       DbIndex db_ind = 0;
+
+      // TODO: remove `it` from ItAndUpdater as it's redundant with respect to this iterator.
       Iterator it;
       std::string_view key;
 
@@ -173,7 +177,7 @@ class DbSlice {
       size_t orig_heap_size = 0;
     };
 
-    AutoUpdater(const Fields& fields);
+    AutoUpdater(DbIndex db_ind, std::string_view key, const Iterator& it, DbSlice* db_slice);
 
     friend class DbSlice;
 
@@ -195,9 +199,9 @@ class DbSlice {
     // Otherwise (string_view is set) then it's a new key that is going to be added to the table.
     std::variant<PrimeTable::bucket_iterator, std::string_view> change;
 
-    ChangeReq(PrimeTable::bucket_iterator it) : change(it) {
+    explicit ChangeReq(PrimeTable::bucket_iterator it) : change(it) {
     }
-    ChangeReq(std::string_view key) : change(key) {
+    explicit ChangeReq(std::string_view key) : change(key) {
     }
 
     const PrimeTable::bucket_iterator* update() const {
@@ -301,7 +305,16 @@ class DbSlice {
   OpResult<ConstIterator> FindReadOnly(const Context& cntx, std::string_view key,
                                        unsigned req_obj_type) const;
 
-  OpResult<ItAndUpdater> AddOrFind(const Context& cntx, std::string_view key);
+  // Consider using req_obj_type to specify the type of object you expect.
+  // Because it can evaluate to bugs like this:
+  // - We already have a key but with another type you expect.
+  // - During FindMutable we will not use req_obj_type, so the object type will not be checked.
+  // - AddOrFind will return the object with this key but with a different type.
+  // - Then you will update this object with a different type, which will lead to an error.
+  // If you proved the key type on your own, please add a comment there why don't specify
+  // req_obj_type
+  OpResult<ItAndUpdater> AddOrFind(const Context& cntx, std::string_view key,
+                                   std::optional<unsigned> req_obj_type);
 
   // Same as AddOrSkip, but overwrites in case entry exists.
   OpResult<ItAndUpdater> AddOrUpdate(const Context& cntx, std::string_view key, PrimeValue obj,
@@ -421,11 +434,19 @@ class DbSlice {
   }
 
   using ChangeCallback = std::function<void(DbIndex, const ChangeReq&)>;
+  // Holds pairs of source and destination cursors for items moved in the dash table
+  using MovedItemsVec = std::vector<std::pair<PrimeTable::Cursor, PrimeTable::Cursor>>;
+  using MovedCallback = std::function<void(DbIndex, const MovedItemsVec&)>;
 
   //! Registers the callback to be called for each change.
   //! Returns the registration id which is also the unique version of the dbslice
   //! at a time of the call.
   uint64_t RegisterOnChange(ChangeCallback cb);
+
+  //! Registers the callback to be called after items are moved in table.
+  //! Returns the registration id which is also the unique version of the dbslice
+  //! at a time of the call.
+  uint64_t RegisterOnMove(MovedCallback cb);
 
   bool HasRegisteredCallbacks() const {
     return !change_cb_.empty();
@@ -436,6 +457,8 @@ class DbSlice {
 
   //! Unregisters the callback.
   void UnregisterOnChange(uint64_t id);
+
+  void UnregisterOnMoved(uint64_t id);
 
   struct DeleteExpiredStats {
     uint32_t deleted = 0;         // number of deleted items due to expiry (less than traversed).
@@ -449,9 +472,10 @@ class DbSlice {
 
   // Evicts items with dynamically allocated data from the primary table.
   // Does not shrink tables.
-  // Returnes number of (elements,bytes) freed due to evictions.
-  std::pair<uint64_t, size_t> FreeMemWithEvictionStep(DbIndex db_indx, size_t starting_segment_id,
-                                                      size_t increase_goal_bytes);
+  // Returns number of (elements,bytes) freed due to evictions.
+  std::pair<uint64_t, size_t> FreeMemWithEvictionStepAtomic(DbIndex db_indx,
+                                                            size_t starting_segment_id,
+                                                            size_t increase_goal_bytes);
 
   int32_t GetNextSegmentForEviction(int32_t segment_id, DbIndex db_ind) const;
 
@@ -536,7 +560,7 @@ class DbSlice {
 
  private:
   void PreUpdateBlocking(DbIndex db_ind, Iterator it);
-  void PostUpdate(DbIndex db_ind, Iterator it, std::string_view key, size_t orig_size);
+  void PostUpdate(DbIndex db_ind, std::string_view key);
 
   bool DelEmptyPrimeValue(const Context& cntx, Iterator it);
 
@@ -561,6 +585,7 @@ class DbSlice {
   // Queues invalidation message to the clients that are tracking the change to a key.
   void QueueInvalidationTrackingMessageAtomic(std::string_view key);
   void SendQueuedInvalidationMessages();
+  void SendQueuedInvalidationMessagesAsync();
 
   void CreateDb(DbIndex index);
 
@@ -576,7 +601,8 @@ class DbSlice {
 
   PrimeItAndExp ExpireIfNeeded(const Context& cntx, PrimeIterator it) const;
 
-  OpResult<ItAndUpdater> AddOrFindInternal(const Context& cntx, std::string_view key);
+  OpResult<ItAndUpdater> AddOrFindInternal(const Context& cntx, std::string_view key,
+                                           std::optional<unsigned> req_obj_type);
 
   OpResult<PrimeItAndExp> FindInternal(const Context& cntx, std::string_view key,
                                        std::optional<unsigned> req_obj_type,
@@ -589,6 +615,7 @@ class DbSlice {
   }
 
   void CallChangeCallbacks(DbIndex id, const ChangeReq& cr) const;
+  void CallMovedCallbacks(DbIndex id, const MovedItemsVec& moved_items);
 
   // We need this because registered callbacks might yield and when they do so we want
   // to avoid Heartbeat or Flushing the db.
@@ -604,6 +631,7 @@ class DbSlice {
   bool expire_allowed_ = true;
 
   uint64_t version_ = 1;  // Used to version entries in the PrimeTable.
+  uint64_t next_moved_id_ = 1;
   ssize_t memory_budget_ = SSIZE_MAX / 2;
   size_t bytes_per_object_ = 0;
   size_t soft_budget_limit_ = 0;
@@ -633,6 +661,8 @@ class DbSlice {
   // ordered from the smallest to largest version.
   std::list<std::pair<uint64_t, ChangeCallback>> change_cb_;
 
+  std::list<std::pair<uint32_t, MovedCallback>> moved_cb_;
+
   // Used in temporary computations in Find item and CbFinish
   // This set is used to hold fingerprints of key accessed during the run of
   // a transaction callback (not the whole transaction).
@@ -660,7 +690,8 @@ class DbSlice {
   // and polymorphic allocator (new C++ features)
   // the declarations below meant to say:
   // absl::flat_hash_map<std::string,
-  //                    absl::flat_hash_set<facade::Connection::WeakRef, Hash>> client_tracking_map_
+  //                    absl::flat_hash_set<facade::Connection::WeakRef, Hash>>
+  //                    client_tracking_map_
   using HashSetAllocator = PMR_NS::polymorphic_allocator<facade::Connection::WeakRef>;
 
   using ConnectionHashSet =
@@ -670,10 +701,13 @@ class DbSlice {
 
   using AllocatorType = PMR_NS::polymorphic_allocator<std::pair<std::string, ConnectionHashSet>>;
 
-  absl::flat_hash_map<std::string, ConnectionHashSet,
-                      absl::container_internal::hash_default_hash<std::string>,
-                      absl::container_internal::hash_default_eq<std::string>, AllocatorType>
-      client_tracking_map_, pending_send_map_;
+  using TrackingMap =
+      absl::flat_hash_map<std::string, ConnectionHashSet,
+                          absl::container_internal::hash_default_hash<std::string>,
+                          absl::container_internal::hash_default_eq<std::string>, AllocatorType>;
+  TrackingMap client_tracking_map_, pending_send_map_;
+
+  void SendQueuedInvalidationMessagesCb(const TrackingMap& track_map, unsigned idx) const;
 
   class PrimeBumpPolicy;
 };

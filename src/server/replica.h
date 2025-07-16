@@ -45,9 +45,9 @@ class Replica : ProtocolClient {
   enum State : unsigned {
     R_ENABLED = 1,  // Replication mode is enabled. Serves for signaling shutdown.
     R_TCP_CONNECTED = 2,
-    R_GREETED = 4,
-    R_SYNCING = 8,
-    R_SYNC_OK = 0x10,
+    R_GREETED = 4,     // Initial handshake with the master is done.
+    R_SYNCING = 8,     // In process of full sync with the master.
+    R_SYNC_OK = 0x10,  // Signals successful ending of full-sync state, exclusive with R_SYNCING.
   };
 
  public:
@@ -59,14 +59,18 @@ class Replica : ProtocolClient {
   // Returns true if initial link with master has been established or
   // false if it has failed.
   GenericError Start();
-  void StartMainReplicationFiber();
+  struct LastMasterSyncData {
+    std::string id;
+    std::vector<LSN> last_journal_LSNs;  // lsn for each master shard.
+  };
+  void StartMainReplicationFiber(std::optional<LastMasterSyncData> data);
 
   // Sets the server state to have replication enabled.
   // It is like Start(), but does not attempt to establish
   // a connection right-away, but instead lets MainReplicationFb do the work.
-  void EnableReplication(facade::SinkReplyBuilder* builder);
+  void EnableReplication();
 
-  void Stop();  // thread-safe
+  std::optional<LastMasterSyncData> Stop();  // thread-safe
 
   void Pause(bool pause);
 
@@ -78,15 +82,15 @@ class Replica : ProtocolClient {
 
  private: /* Main standalone mode functions */
   // Coordinate state transitions. Spawned by start.
-  void MainReplicationFb();
+  void MainReplicationFb(std::optional<LastMasterSyncData> data);
 
   std::error_code Greet();  // Send PING and REPLCONF.
 
   std::error_code HandleCapaDflyResp();
   std::error_code ConfigureDflyMaster();
 
-  std::error_code InitiatePSync();     // Redis full sync.
-  std::error_code InitiateDflySync();  // Dragonfly full sync.
+  std::error_code InitiatePSync();                                           // Redis full sync.
+  std::error_code InitiateDflySync(std::optional<LastMasterSyncData> data);  // Dragonfly full sync.
 
   std::error_code ConsumeRedisStream();  // Redis stable state.
   std::error_code ConsumeDflyStream();   // Dragonfly stable state.
@@ -125,6 +129,8 @@ class Replica : ProtocolClient {
 
     // sum of the offsets on all the flows.
     uint64_t repl_offset_sum;
+    size_t psync_attempts;
+    size_t psync_successes;
   };
 
   Summary GetSummary() const;  // thread-safe, blocks fiber, makes a hop.
@@ -135,6 +141,9 @@ class Replica : ProtocolClient {
 
   std::vector<uint64_t> GetReplicaOffset() const;
   std::string GetSyncId() const;
+
+  // Get the current replication phase based on state_mask_
+  std::string GetCurrentPhase() const;
 
  private:
   util::fb2::ProactorBase* proactor_ = nullptr;
@@ -160,7 +169,7 @@ class Replica : ProtocolClient {
   // repl_offs - till what offset we've already read from the master.
   // ack_offs_ last acknowledged offset.
   size_t repl_offs_ = 0, ack_offs_ = 0;
-  std::atomic<unsigned> state_mask_ = 0;
+  unsigned state_mask_ = 0;  // see State enum above.
 
   bool is_paused_ = false;
   std::string id_;
@@ -168,6 +177,8 @@ class Replica : ProtocolClient {
   std::optional<cluster::SlotRange> slot_range_;
 
   uint32_t reconnect_count_ = 0;
+  size_t psync_attempts_ = 0;
+  size_t psync_successes_ = 0;
 };
 
 class RdbLoader;
@@ -185,7 +196,8 @@ class DflyShardReplica : public ProtocolClient {
   // Start replica initialized as dfly flow.
   // Sets is_full_sync when successful.
   io::Result<bool> StartSyncFlow(util::fb2::BlockingCounter block, ExecutionState* cntx,
-                                 std::optional<LSN>);
+                                 std::optional<LSN>,
+                                 std::optional<Replica::LastMasterSyncData> data);
 
   // Transition into stable state mode as dfly flow.
   std::error_code StartStableSyncFlow(ExecutionState* cntx);
@@ -199,7 +211,9 @@ class DflyShardReplica : public ProtocolClient {
 
   void StableSyncDflyAcksFb(ExecutionState* cntx);
 
-  void ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx);
+  // Return true if the transaction executed successfully. On error,
+  // or on context cancellation return false.
+  bool ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx);
 
   uint32_t FlowId() const;
 

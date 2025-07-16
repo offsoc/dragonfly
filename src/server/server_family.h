@@ -91,6 +91,7 @@ struct Metrics {
   size_t small_string_bytes = 0;
   uint32_t traverse_ttl_per_sec = 0;
   uint32_t delete_ttl_per_sec = 0;
+  uint64_t hoffman_encode_total = 0, hoffman_encode_success = 0;
   uint64_t fiber_switch_cnt = 0;
   uint64_t fiber_switch_delay_usec = 0;
   uint64_t tls_bytes = 0;
@@ -106,6 +107,9 @@ struct Metrics {
   uint32_t worker_fiber_count = 0;
   uint32_t blocked_tasks = 0;
   size_t worker_fiber_stack_size = 0;
+
+  size_t lsn_buffer_size = 0;
+  size_t lsn_buffer_bytes = 0;
 
   // monotonic timestamp (ProactorBase::GetMonotonicTimeNs) of the connection stuck on send
   // for longest time.
@@ -128,6 +132,8 @@ struct Metrics {
   size_t migration_errors_total;
 
   LoadingStats loading_stats;
+
+  absl::flat_hash_map<std::string, hdr_histogram*> cmd_latency_map;
 };
 
 struct LastSaveInfo {
@@ -146,6 +152,9 @@ struct LastSaveInfo {
   GenericError last_error;
   time_t last_error_time = 0;      // epoch time in seconds.
   time_t failed_duration_sec = 0;  // epoch time in seconds.
+  // false if last attempt failed
+  bool last_bgsave_status = true;
+  bool bgsave_in_progress = false;
 };
 
 struct SnapshotSpec {
@@ -219,8 +228,8 @@ class ServerFamily {
 
   // Load snapshot from file (.rdb file or summary.dfs file) and return
   // future with error_code.
-  enum class LoadExistingKeys { kFail, kOverride };
-  std::optional<util::fb2::Future<GenericError>> Load(std::string_view file_name,
+  enum class LoadExistingKeys : uint8_t { kFail, kOverride };
+  std::optional<util::fb2::Future<GenericError>> Load(const std::string& file_name,
                                                       LoadExistingKeys existing_keys);
 
   bool TEST_IsSaving() const;
@@ -240,6 +249,10 @@ class ServerFamily {
 
   DflyCmd* GetDflyCmd() const {
     return dfly_cmd_.get();
+  }
+
+  std::optional<Replica::LastMasterSyncData> GetLastMasterData() const {
+    return last_master_data_;
   }
 
   absl::Span<facade::Listener* const> GetListeners() const {
@@ -325,8 +338,16 @@ class ServerFamily {
   void ReplicaOfInternal(CmdArgList args, Transaction* tx, SinkReplyBuilder* builder,
                          ActionOnConnectionFail on_error) ABSL_LOCKS_EXCLUDED(replicaof_mu_);
 
-  // Returns the number of loaded keys if successful.
-  io::Result<size_t> LoadRdb(const std::string& rdb_file, LoadExistingKeys existing_keys);
+  struct LoadOptions {
+    std::string snapshot_id;
+    uint32_t shard_count = 0;      // Shard count of the snapshot being loaded.
+    uint64_t num_loaded_keys = 0;  // Number of keys loaded.
+  };
+
+  // Updates LoadOptions if successful. If snapshot_id and shard_count are passed in,
+  // may use them for consistency checks.
+  std::error_code LoadRdb(const std::string& rdb_file, LoadExistingKeys existing_keys,
+                          LoadOptions* load_opts);
 
   void SnapshotScheduling() ABSL_LOCKS_EXCLUDED(loading_stats_mu_);
 
@@ -336,8 +357,13 @@ class ServerFamily {
 
   void BgSaveFb(boost::intrusive_ptr<Transaction> trans);
 
+  struct DoSaveCheckAndStartOpts {
+    bool ignore_state = false;
+    bool bg_save = false;
+  };
+
   GenericError DoSaveCheckAndStart(const SaveCmdOptions& save_cmd_opts, Transaction* trans,
-                                   bool ignore_state = false) ABSL_LOCKS_EXCLUDED(save_mu_);
+                                   DoSaveCheckAndStartOpts opts) ABSL_LOCKS_EXCLUDED(save_mu_);
 
   GenericError WaitUntilSaveFinished(Transaction* trans,
                                      bool ignore_state = false) ABSL_NO_THREAD_SAFETY_ANALYSIS;
@@ -368,6 +394,7 @@ class ServerFamily {
   std::unique_ptr<DflyCmd> dfly_cmd_;
 
   std::string master_replid_;
+  std::optional<Replica::LastMasterSyncData> last_master_data_;
 
   time_t start_time_ = 0;  // in seconds, epoch time.
 

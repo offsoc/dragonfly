@@ -9,7 +9,7 @@ extern "C" {
 
 #include <absl/strings/ascii.h>
 #include <absl/strings/str_join.h>
-#include <absl/strings/str_split.h>
+#include <absl/strings/strip.h>
 #include <gmock/gmock.h>
 #include <reflex/matcher.h>
 
@@ -17,6 +17,7 @@ extern "C" {
 #include "base/gtest.h"
 #include "base/logging.h"
 #include "facade/facade_test.h"
+#include "server/conn_context.h"
 #include "server/main_service.h"
 #include "server/test_utils.h"
 
@@ -24,9 +25,10 @@ ABSL_DECLARE_FLAG(float, mem_defrag_threshold);
 ABSL_DECLARE_FLAG(float, mem_defrag_waste_threshold);
 ABSL_DECLARE_FLAG(uint32_t, mem_defrag_check_sec_interval);
 ABSL_DECLARE_FLAG(std::vector<std::string>, rename_command);
-ABSL_DECLARE_FLAG(std::vector<std::string>, command_alias);
 ABSL_DECLARE_FLAG(bool, lua_resp2_legacy_float);
 ABSL_DECLARE_FLAG(double, eviction_memory_budget_threshold);
+ABSL_DECLARE_FLAG(std::vector<std::string>, command_alias);
+ABSL_DECLARE_FLAG(bool, latency_tracking);
 
 namespace dfly {
 
@@ -118,7 +120,8 @@ class DflyRenameCommandTest : public DflyEngineTest {
         &FLAGS_rename_command,
         std::vector<std::string>({"flushall=myflushall", "flushdb=", "ping=abcdefghijklmnop"}));
   }
-  absl::FlagSaver saver_;
+
+  absl::FlagSaver _saver;
 };
 
 TEST_F(DflyRenameCommandTest, RenameCommand) {
@@ -339,6 +342,9 @@ TEST_F(DflyEngineTest, Memcache) {
   auto resp = RunMC(MP::SET, "key", "bar", 1);
   EXPECT_THAT(resp, ElementsAre("STORED"));
 
+  resp = RunMC(MP::GETS, "key");
+  EXPECT_THAT(resp, ElementsAre("VALUE key 1 3 0", "bar", "END"));
+
   resp = RunMC(MP::GET, "key");
   EXPECT_THAT(resp, ElementsAre("VALUE key 1 3", "bar", "END"));
 
@@ -364,6 +370,30 @@ TEST_F(DflyEngineTest, Memcache) {
 
   resp = RunMC(MP::GET, "unkn");
   EXPECT_THAT(resp, ElementsAre("END"));
+
+  resp = GetMC(MP::GETS, {"key", "key2", "unknown"});
+  EXPECT_THAT(resp, ElementsAre("VALUE key 1 3 0", "bar", "VALUE key2 2 8 0", "bar2val2", "END"));
+
+  EXPECT_THAT(RunMC(MP::SET, "foo", "bar"), ElementsAre("STORED"));
+  // The value here is 1 month + 1 second, memcache treats an expiry of greater than 1 month as
+  // absolute value. GAT expiry seconds are counted from epoch, setting expiry in the past results
+  // in the key being removed.
+  constexpr uint32_t short_expiry = 60 * 60 * 24 * 30 + 1;
+  EXPECT_THAT(GetMC(MP::GAT, {StrCat(short_expiry), "foo"}), ElementsAre("END"));
+
+  EXPECT_THAT(RunMC(MP::SET, "foo", "bar"), ElementsAre("STORED"));
+
+  // 30 seconds into the future
+  EXPECT_THAT(GetMC(MP::GAT, {"30", "foo", "abc", "def", "ghi"}),
+              ElementsAre("VALUE foo 0 3", "bar", "END"));
+
+  EXPECT_THAT(GetMC(MP::GAT, {"1000"}),
+              ElementsAre("SERVER_ERROR wrong number of arguments for 'gat' command"));
+
+  EXPECT_THAT(RunMC(MP::SET, "persisted-key", "bar"), ElementsAre("STORED"));
+  // expiry of 0 removes the key expiry
+  EXPECT_THAT(GetMC(MP::GAT, {"0", "persisted-key"}),
+              ElementsAre("VALUE persisted-key 0 3", "bar", "END"));
 }
 
 TEST_F(DflyEngineTest, MemcacheFlags) {
@@ -473,15 +503,8 @@ TEST_F(DflyEngineTest, Bug207) {
     ASSERT_EQ(resp, "OK");
   }
 
-  auto evicted_count = [](const string& str) -> size_t {
-    const string matcher = "evicted_keys:";
-    const auto pos = str.find(matcher) + matcher.size();
-    const auto sub = str.substr(pos, 1);
-    return atoi(sub.c_str());
-  };
-
-  resp = Run({"info", "stats"});
-  EXPECT_GT(evicted_count(resp.GetString()), 0);
+  auto metrics = GetMetrics();
+  EXPECT_GT(metrics.events.evicted_keys, 0) << FormatMetrics(metrics);
 
   for (; i > 0; --i) {
     resp = Run({"setex", StrCat("key", i), "30", "bar"});
@@ -529,6 +552,49 @@ TEST_F(DflyEngineTest, StickyEviction) {
 
 #endif
 
+TEST_F(DflyEngineTest, ZeroAllocationEviction) {
+  max_memory_limit = 500000;  // 0.5mb
+  shard_set->TEST_EnableCacheMode();
+
+  // Create entries with zero-allocation values (small integers)
+  // but with long keys to consume memory
+  string long_key_prefix(50, 'k');  // 50 character prefix
+
+  vector<string> keys;
+  int successful_sets = 0;
+  for (int i = 0; i < 1000; ++i) {
+    string key = StrCat(long_key_prefix, i);
+    auto result = Run({"set", key, to_string(i)});  // small integer value
+    if (result == "OK") {
+      keys.emplace_back(key);
+      successful_sets++;
+    } else {
+      break;  // Stop when we hit memory limit
+    }
+  }
+
+  ASSERT_GT(successful_sets, 10) << "Should be able to set at least some keys";
+
+  // Fill up more memory to trigger eviction
+  string large_value(500, 'v');
+  for (int i = 0; i < 500; ++i) {
+    string key = StrCat("trigger", i);
+    Run({"set", key, large_value});  // This will trigger eviction
+  }
+
+  // Verify that some zero-allocation entries were evicted
+  int evicted_count = 0;
+  for (const string& key : keys) {
+    if (Run({"exists", key}).GetInt() == 0) {
+      evicted_count++;
+    }
+  }
+
+  // Should have evicted some entries with zero-allocation values
+  // but not external (disk storage) entries
+  EXPECT_GT(evicted_count, 0) << "Zero-allocation entries should be evicted under memory pressure";
+}
+
 TEST_F(DflyEngineTest, PSubscribe) {
   single_response_ = false;
   auto resp = pp_->at(1)->Await([&] { return Run({"psubscribe", "a*", "b*"}); });
@@ -544,6 +610,23 @@ TEST_F(DflyEngineTest, PSubscribe) {
   EXPECT_EQ("foo", msg.message);
   EXPECT_EQ("ab", msg.channel);
   EXPECT_EQ("a*", msg.pattern);
+}
+
+TEST_F(DflyEngineTest, PSubscribeMatchOnlyStar) {
+  single_response_ = false;
+  auto resp = pp_->at(1)->Await([&] { return Run({"psubscribe", "*"}); });
+  EXPECT_THAT(resp, ArrLen(3));
+  resp = pp_->at(0)->Await([&] { return Run({"PUBLISH", "1234567890123456", "abc"}); });
+  EXPECT_THAT(resp, IntArg(1));
+
+  pp_->AwaitFiberOnAll([](ProactorBase* pb) {});
+
+  ASSERT_EQ(1, SubscriberMessagesLen("IO1"));
+
+  const auto& msg = GetPublishedMessage("IO1", 0);
+  EXPECT_EQ("abc", msg.message);
+  EXPECT_EQ("1234567890123456", msg.channel);
+  EXPECT_EQ("*", msg.pattern);
 }
 
 TEST_F(DflyEngineTest, Unsubscribe) {
@@ -607,19 +690,19 @@ TEST_F(DflyEngineTest, Bug496) {
         db.RegisterOnChange([&cb_hits](DbIndex, const DbSlice::ChangeReq&) { cb_hits++; });
 
     {
-      auto res = *db.AddOrFind({}, "key-1");
+      auto res = *db.AddOrFind({}, "key-1", std::nullopt);
       EXPECT_TRUE(res.is_new);
       EXPECT_EQ(cb_hits, 1);
     }
 
     {
-      auto res = *db.AddOrFind({}, "key-1");
+      auto res = *db.AddOrFind({}, "key-1", std::nullopt);
       EXPECT_FALSE(res.is_new);
       EXPECT_EQ(cb_hits, 2);
     }
 
     {
-      auto res = *db.AddOrFind({}, "key-2");
+      auto res = *db.AddOrFind({}, "key-2", std::nullopt);
       EXPECT_TRUE(res.is_new);
       EXPECT_EQ(cb_hits, 3);
     }
@@ -848,9 +931,8 @@ TEST_F(DflyEngineTest, CommandMetricLabels) {
 class DflyCommandAliasTest : public DflyEngineTest {
  protected:
   DflyCommandAliasTest() {
-    // Test an interaction of rename and alias, where we rename and then add an alias on the rename
-    absl::SetFlag(&FLAGS_rename_command, {"ping=gnip"});
-    absl::SetFlag(&FLAGS_command_alias, {"___set=set", "___ping=gnip"});
+    SetFlag(&FLAGS_command_alias, {"___set=set", "___ping=ping"});
+    SetFlag(&FLAGS_latency_tracking, true);
   }
 
   absl::FlagSaver saver_;
@@ -861,19 +943,40 @@ TEST_F(DflyCommandAliasTest, Aliasing) {
   EXPECT_EQ(Run({"___SET", "a", "b"}), "OK");
   EXPECT_EQ(Run({"GET", "foo"}), "bar");
   EXPECT_EQ(Run({"GET", "a"}), "b");
-  // test the alias
   EXPECT_EQ(Run({"___ping"}), "PONG");
-  // test the rename
-  EXPECT_EQ(Run({"gnip"}), "PONG");
-  // the original command is not accessible
-  EXPECT_THAT(Run({"PING"}), ErrArg("unknown command `PING`"));
 
-  const Metrics metrics = GetMetrics();
+  Metrics metrics = GetMetrics();
   const auto& stats = metrics.cmd_stats_map;
+
   EXPECT_THAT(stats, Contains(Pair("___set", Key(1))));
   EXPECT_THAT(stats, Contains(Pair("set", Key(1))));
   EXPECT_THAT(stats, Contains(Pair("___ping", Key(1))));
   EXPECT_THAT(stats, Contains(Pair("get", Key(2))));
+
+  // test stats within multi-exec
+  EXPECT_EQ(Run({"multi"}), "OK");
+  EXPECT_EQ(Run({"___set", "a", "x"}), "QUEUED");
+  EXPECT_EQ(Run({"exec"}), "OK");
+
+  metrics = GetMetrics();
+  EXPECT_THAT(metrics.cmd_stats_map, Contains(Pair("___set", Key(2))));
+  EXPECT_THAT(metrics.cmd_stats_map, Contains(Pair("set", Key(1))));
+  EXPECT_THAT(metrics.cmd_stats_map, Contains(Pair("multi", Key(1))));
+  EXPECT_THAT(metrics.cmd_stats_map, Contains(Pair("exec", Key(1))));
+}
+
+TEST_F(DflyCommandAliasTest, AliasesShareHistogramPtr) {
+  EXPECT_EQ(Run({"SET", "foo", "bar"}), "OK");
+  EXPECT_EQ(Run({"___SET", "a", "b"}), "OK");
+  EXPECT_EQ(Run({"___ping"}), "PONG");
+
+  const auto command_histograms = GetMetrics().cmd_latency_map;
+  for (const auto& key : {"set", "___set", "___ping", "ping"}) {
+    EXPECT_TRUE(command_histograms.contains(key));
+  }
+
+  EXPECT_EQ(command_histograms.at("set"), command_histograms.at("___set"));
+  EXPECT_EQ(command_histograms.at("ping"), command_histograms.at("___ping"));
 }
 
 }  // namespace dfly

@@ -261,6 +261,17 @@ __thread EngineShard* EngineShard::shard_ = nullptr;
 uint64_t TEST_current_time_ms = 0;
 
 ShardId Shard(string_view v, ShardId shard_num) {
+  // This cluster sharding is not necessary and may degrade keys distribution among shard threads.
+  // For example, if we have 3 shards, then no single-char keys will be assigned to shard 2 and
+  // 32 single char keys in range ['_' - '~'] will be assigned to shard 0.
+  // Yes, SlotId function does not have great distribution properties.
+  // On the other side, slot based sharding may help with pipeline squashing optimizations,
+  // because they rely on commands being single-sharded.
+  // TODO: once we improve our squashing logic, we can remove this.
+  if (IsClusterShardedBySlot()) {
+    return KeySlot(v) % shard_num;
+  }
+
   if (IsClusterShardedByTag()) {
     v = LockTagOptions::instance().Tag(v);
   }
@@ -297,7 +308,7 @@ string EngineShard::TxQueueInfo::Format() const {
 }
 
 EngineShard::Stats& EngineShard::Stats::operator+=(const EngineShard::Stats& o) {
-  static_assert(sizeof(Stats) == 64);
+  static_assert(sizeof(Stats) == 96);
 
 #define ADD(x) x += o.x
 
@@ -309,6 +320,10 @@ EngineShard::Stats& EngineShard::Stats::operator+=(const EngineShard::Stats& o) 
   ADD(tx_optimistic_total);
   ADD(tx_batch_schedule_calls_total);
   ADD(tx_batch_scheduled_items_total);
+  ADD(total_heartbeat_expired_keys);
+  ADD(total_heartbeat_expired_bytes);
+  ADD(total_heartbeat_expired_calls);
+  ADD(total_migrated_keys);
 
 #undef ADD
   return *this;
@@ -333,9 +348,8 @@ void EngineShard::DefragTaskState::ResetScanState() {
 // 3. in case the above is OK, make sure that we have a "gap" between usage and commited memory
 // (control by mem_defrag_waste_threshold flag)
 bool EngineShard::DefragTaskState::CheckRequired() {
-  if (is_force_defrag || cursor > kCursorDoneState) {
-    is_force_defrag = false;
-    VLOG(2) << "cursor: " << cursor << " and is_force_defrag " << is_force_defrag;
+  if (cursor > kCursorDoneState) {
+    VLOG(2) << "cursor: " << cursor;
     return true;
   }
 
@@ -369,11 +383,7 @@ bool EngineShard::DefragTaskState::CheckRequired() {
   return false;
 }
 
-void EngineShard::ForceDefrag() {
-  defrag_state_.is_force_defrag = true;
-}
-
-bool EngineShard::DoDefrag() {
+bool EngineShard::DoDefrag(const float threshold) {
   // --------------------------------------------------------------------------
   // NOTE: This task is running with exclusive access to the shard.
   // i.e. - Since we are using shared nothing access here, and all access
@@ -382,7 +392,6 @@ bool EngineShard::DoDefrag() {
   // --------------------------------------------------------------------------
 
   constexpr size_t kMaxTraverses = 40;
-  const float threshold = GetFlag(FLAGS_mem_defrag_page_utilization_threshold);
 
   // TODO: enable tiered storage on non-default db slice
   DbSlice& slice = namespaces->GetDefaultNamespace().GetDbSlice(shard_->shard_id());
@@ -399,7 +408,7 @@ bool EngineShard::DoDefrag() {
 
   DCHECK(slice.IsDbValid(defrag_state_.dbid));
   auto [prime_table, expire_table] = slice.GetTables(defrag_state_.dbid);
-  PrimeTable::Cursor cur = defrag_state_.cursor;
+  PrimeTable::Cursor cur{defrag_state_.cursor};
   uint64_t reallocations = 0;
   unsigned traverses_count = 0;
   uint64_t attempts = 0;
@@ -417,7 +426,7 @@ bool EngineShard::DoDefrag() {
     traverses_count++;
   } while (traverses_count < kMaxTraverses && cur && namespaces);
 
-  defrag_state_.UpdateScanState(cur.value());
+  defrag_state_.UpdateScanState(cur.token());
 
   if (reallocations > 0) {
     VLOG(1) << "shard " << slice.shard_id() << ": successfully defrag  " << reallocations
@@ -453,7 +462,8 @@ uint32_t EngineShard::DefragTask() {
 
   if (defrag_state_.CheckRequired()) {
     VLOG(2) << shard_id_ << ": need to run defrag memory cursor state: " << defrag_state_.cursor;
-    if (DoDefrag()) {
+    static const float threshold = GetFlag(FLAGS_mem_defrag_page_utilization_threshold);
+    if (DoDefrag(threshold)) {
       // we didn't finish the scan
       return util::ProactorBase::kOnIdleMaxLevel;
     }
@@ -634,6 +644,7 @@ void EngineShard::PollExecution(const char* context, Transaction* trans) {
   }
 
   bool update_stats = false;
+  ++poll_concurrent_factor_;
 
   auto run = [this, &update_stats](Transaction* tx, bool allow_removal) -> bool /* concluding */ {
     update_stats = true;
@@ -649,6 +660,9 @@ void EngineShard::PollExecution(const char* context, Transaction* trans) {
     if ((is_self && disarmed) || continuation_trans_->DisarmInShard(sid)) {
       if (bool concludes = run(continuation_trans_, true); concludes) {
         continuation_trans_ = nullptr;
+        continuation_debug_id_.clear();
+      } else {
+        continuation_debug_id_ = continuation_trans_->DebugId(sid);
       }
     }
   }
@@ -689,6 +703,7 @@ void EngineShard::PollExecution(const char* context, Transaction* trans) {
     if (bool concludes = run(head, true); !concludes) {
       DCHECK_EQ(head->DEBUG_GetTxqPosInShard(sid), TxQueue::kEnd) << head->DebugId(sid);
       continuation_trans_ = head;
+      continuation_debug_id_ = head->DebugId(sid);
     }
   }
 
@@ -714,6 +729,7 @@ void EngineShard::PollExecution(const char* context, Transaction* trans) {
       LOG_IF(DFATAL, trans->DEBUG_GetTxqPosInShard(sid) == TxQueue::kEnd);
     }
   }
+  --poll_concurrent_factor_;
   if (update_stats) {
     CacheStats();
   }
@@ -722,6 +738,7 @@ void EngineShard::PollExecution(const char* context, Transaction* trans) {
 void EngineShard::RemoveContTx(Transaction* tx) {
   if (continuation_trans_ == tx) {
     continuation_trans_ = nullptr;
+    continuation_debug_id_.clear();
   }
 }
 
@@ -742,7 +759,9 @@ void EngineShard::Heartbeat() {
   if (db_slice.WillBlockOnJournalWrite() || !can_acquire_global_lock) {
     const auto elapsed = std::chrono::system_clock::now() - start;
     if (elapsed > std::chrono::seconds(1)) {
-      LOG_EVERY_T(WARNING, 5) << "Stalled heartbeat() fiber for " << elapsed.count() << " seconds";
+      const auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed);
+      LOG_EVERY_T(WARNING, 5) << "Stalled heartbeat() fiber for " << elapsed_seconds.count()
+                              << " seconds";
     }
     return;
   }
@@ -805,18 +824,24 @@ void EngineShard::RetireExpiredAndEvict() {
 
     db_cntx.db_index = i;
     auto [pt, expt] = db_slice.GetTables(i);
-    if (expt->size() > pt->size() / 4) {
+    if (!expt->Empty()) {
       DbSlice::DeleteExpiredStats stats = db_slice.DeleteExpiredStep(db_cntx, ttl_delete_target);
 
       eviction_goal -= std::min(eviction_goal, size_t(stats.deleted_bytes));
       counter_[TTL_TRAVERSE].IncBy(stats.traversed);
       counter_[TTL_DELETE].IncBy(stats.deleted);
+      stats_.total_heartbeat_expired_keys += stats.deleted;
+      stats_.total_heartbeat_expired_bytes += stats.deleted_bytes;
+      ++stats_.total_heartbeat_expired_calls;
+      VLOG(1) << "Heartbeat expired " << stats.deleted << " keys with total bytes "
+              << stats.deleted_bytes << " with total expire flow calls "
+              << stats_.total_heartbeat_expired_calls;
     }
 
     if (eviction_goal) {
       uint32_t starting_segment_id = rand() % pt->GetSegmentCount();
       auto [evicted_items, evicted_bytes] =
-          db_slice.FreeMemWithEvictionStep(i, starting_segment_id, eviction_goal);
+          db_slice.FreeMemWithEvictionStepAtomic(i, starting_segment_id, eviction_goal);
 
       DVLOG(2) << "Heartbeat eviction: Expected to evict " << eviction_goal
                << " bytes. Actually evicted " << evicted_items << " items, " << evicted_bytes

@@ -76,7 +76,7 @@ FieldValue ExtractSortableValueFromJson(const search::Schema& schema, string_vie
   if (json.is_null()) {
     return std::monostate{};
   }
-  auto json_as_string = json.to_string();
+  auto json_as_string = json.as_string();
   return ExtractSortableValue(schema, key, json_as_string);
 }
 
@@ -101,23 +101,17 @@ bool ProcessJsonElements(const std::vector<JsonType>& json_elements,
 }  // namespace
 
 SearchDocData BaseAccessor::Serialize(const search::Schema& schema,
-                                      absl::Span<const SearchField> fields) const {
+                                      absl::Span<const FieldReference> fields) const {
   SearchDocData out{};
   for (const auto& field : fields) {
-    const auto& fident = field.GetIdentifier(schema, false);
-    const auto& fname = field.GetShortName(schema);
-
+    string_view fident = field.Identifier(schema, false);
     auto field_value =
         ExtractSortableValue(schema, fident, absl::StrJoin(GetStrings(fident).value(), ","));
     if (field_value) {
-      out[fname] = std::move(field_value).value();
+      out[field.OutputName()] = std::move(field_value).value();
     }
   }
   return out;
-}
-
-SearchDocData BaseAccessor::SerializeDocument(const search::Schema& schema) const {
-  return Serialize(schema);
 }
 
 std::optional<BaseAccessor::VectorInfo> BaseAccessor::GetVector(
@@ -364,7 +358,10 @@ JsonAccessor::JsonPathContainer* JsonAccessor::GetPath(std::string_view field) c
   }
 
   if (!ptr) {
-    LOG(WARNING) << "Invalid Json path: " << field << ' ' << ec_msg;
+    // This can occur for fields that are not actual JSON paths but are computed aliases
+    // (e.g., 'vector_distance' from a KNN search clause in FT.SEARCH RETURN).
+    // Such fields are valid for return but won't be found as paths in the document.
+    VLOG(1) << "Invalid Json path: " << field << ' ' << ec_msg;
     return nullptr;
   }
 
@@ -373,24 +370,16 @@ JsonAccessor::JsonPathContainer* JsonAccessor::GetPath(std::string_view field) c
   return path;
 }
 
-SearchDocData JsonAccessor::Serialize(const search::Schema& schema) const {
-  SearchFieldsList fields{};
-  for (const auto& [fname, fident] : schema.field_names)
-    fields.emplace_back(StringOrView::FromView(fident), false, StringOrView::FromView(fname));
-  return Serialize(schema, fields);
-}
-
 SearchDocData JsonAccessor::Serialize(const search::Schema& schema,
-                                      absl::Span<const SearchField> fields) const {
+                                      absl::Span<const FieldReference> fields) const {
   SearchDocData out{};
   for (const auto& field : fields) {
-    const auto& ident = field.GetIdentifier(schema, true);
-    const auto& name = field.GetShortName(schema);
+    string_view ident = field.Identifier(schema, true);
     if (auto* path = GetPath(ident); path) {
       if (auto res = path->Evaluate(json_); !res.empty()) {
         auto field_value = ExtractSortableValueFromJson(schema, ident, res[0]);
         if (field_value) {
-          out[name] = std::move(field_value).value();
+          out[field.OutputName()] = std::move(field_value).value();
         }
       }
     }
@@ -398,7 +387,7 @@ SearchDocData JsonAccessor::Serialize(const search::Schema& schema,
   return out;
 }
 
-SearchDocData JsonAccessor::SerializeDocument(const search::Schema& schema) const {
+SearchDocData JsonAccessor::Serialize(const search::Schema& schema) const {
   return {{"$", json_.to_string()}};
 }
 

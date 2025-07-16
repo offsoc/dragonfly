@@ -6,6 +6,7 @@
 #include <chrono>
 
 #include "absl/strings/match.h"
+#include "facade/service_interface.h"
 
 extern "C" {
 #include "redis/rdb.h"
@@ -24,12 +25,26 @@ extern "C" {
 
 #include "base/logging.h"
 #include "facade/redis_parser.h"
+#include "facade/socket_utils.h"
 #include "server/error.h"
 #include "server/journal/executor.h"
 #include "server/journal/serializer.h"
 #include "server/main_service.h"
 #include "server/rdb_load.h"
 #include "strings/human_readable.h"
+
+#define LOG_REPL_ERROR(msg)                                         \
+  do {                                                              \
+    if (state_mask_ & R_ENABLED) {                                  \
+      if ((state_mask_ & R_SYNCING) || (state_mask_ & R_SYNC_OK)) { \
+        LOG(WARNING) << msg;                                        \
+      } else {                                                      \
+        LOG(ERROR) << msg;                                          \
+      }                                                             \
+    } else {                                                        \
+      VLOG(1) << msg;                                               \
+    }                                                               \
+  } while (0)
 
 ABSL_FLAG(int, replication_acks_interval, 1000, "Interval between acks in milliseconds.");
 ABSL_FLAG(int, master_connect_timeout_ms, 20000,
@@ -119,30 +134,31 @@ GenericError Replica::Start() {
 
   // 3. Greet.
   VLOG(1) << "Greeting";
-  state_mask_.store(R_ENABLED | R_TCP_CONNECTED);
+  state_mask_ = R_ENABLED | R_TCP_CONNECTED;
   ec = Greet();
   RETURN_ON_ERR(check_connection_error(ec, "could not greet master "));
 
   return {};
 }
 
-void Replica::StartMainReplicationFiber() {
-  sync_fb_ = fb2::Fiber("main_replication", &Replica::MainReplicationFb, this);
+void Replica::StartMainReplicationFiber(std::optional<LastMasterSyncData> last_master_sync_data) {
+  sync_fb_ = fb2::Fiber("main_replication", &Replica::MainReplicationFb, this,
+                        std::move(last_master_sync_data));
 }
 
-void Replica::EnableReplication(facade::SinkReplyBuilder* builder) {
+void Replica::EnableReplication() {
   VLOG(1) << "Enabling replication";
 
-  state_mask_.store(R_ENABLED);                             // set replica state to enabled
-  sync_fb_ = MakeFiber(&Replica::MainReplicationFb, this);  // call replication fiber
+  state_mask_ = R_ENABLED;                                           // set replica state to enabled
+  sync_fb_ = MakeFiber(&Replica::MainReplicationFb, this, nullopt);  // call replication fiber
 }
 
-void Replica::Stop() {
+std::optional<Replica::LastMasterSyncData> Replica::Stop() {
   VLOG(1) << "Stopping replication " << this;
   // Stops the loop in MainReplicationFb.
 
   proactor_->Await([this] {
-    state_mask_.store(0);          // Specifically ~R_ENABLED.
+    state_mask_ = 0;               // Specifically ~R_ENABLED.
     exec_st_.ReportCancelError();  // Context is fully resposible for cleanup.
   });
 
@@ -154,6 +170,11 @@ void Replica::Stop() {
   for (auto& flow : shard_flows_) {
     flow.reset();
   }
+
+  if (last_journal_LSNs_.has_value()) {
+    return LastMasterSyncData{master_context_.master_repl_id, last_journal_LSNs_.value()};
+  }
+  return nullopt;
 }
 
 void Replica::Pause(bool pause) {
@@ -183,24 +204,25 @@ std::error_code Replica::TakeOver(std::string_view timeout, bool save_flag) {
   return ec;
 }
 
-void Replica::MainReplicationFb() {
+void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sync_data) {
   VLOG(1) << "Main replication fiber started " << this;
   // Switch shard states to replication.
   SetShardStates(true);
 
   error_code ec;
-  while (state_mask_.load() & R_ENABLED) {
+  while (state_mask_ & R_ENABLED) {
     // Discard all previous errors and set default error handler.
     exec_st_.Reset([this](const GenericError& ge) { this->DefaultErrorHandler(ge); });
     // 1. Connect socket.
-    if ((state_mask_.load() & R_TCP_CONNECTED) == 0) {
+    if ((state_mask_ & R_TCP_CONNECTED) == 0) {
       ThisFiber::SleepFor(500ms);
       if (is_paused_)
         continue;
 
       ec = ResolveHostDns();
       if (ec) {
-        LOG(ERROR) << "Error resolving dns to " << server().host << " " << ec;
+        LOG(ERROR) << "Error resolving dns to " << server().host << " (phase: " << GetCurrentPhase()
+                   << "): " << ec;
         continue;
       }
 
@@ -208,56 +230,63 @@ void Replica::MainReplicationFb() {
       reconnect_count_++;
       ec = ConnectAndAuth(absl::GetFlag(FLAGS_master_reconnect_timeout_ms) * 1ms, &exec_st_);
       if (ec) {
-        LOG(WARNING) << "Error connecting to " << server().Description() << " " << ec;
+        LOG(WARNING) << "Error connecting to " << server().Description()
+                     << " (phase: " << GetCurrentPhase() << "): " << ec
+                     << ", reason: " << ec.message();
         continue;
       }
       VLOG(1) << "Replica socket connected";
-      state_mask_.fetch_or(R_TCP_CONNECTED);
+      state_mask_ |= R_TCP_CONNECTED;
       continue;
     }
 
+    DCHECK(Proactor() == proactor_);
+
     // 2. Greet.
-    if ((state_mask_.load() & R_GREETED) == 0) {
+    if ((state_mask_ & R_GREETED) == 0) {
       ec = Greet();
       if (ec) {
-        LOG(INFO) << "Error greeting " << server().Description() << " " << ec << " "
-                  << ec.message();
-        state_mask_.fetch_and(R_ENABLED);
+        LOG(WARNING) << "Error greeting " << server().Description()
+                     << " (phase: " << GetCurrentPhase() << "): " << ec << " " << ec.message()
+                     << ", socket state: " + GetSocketInfo(Sock()->native_handle());
+        state_mask_ &= R_ENABLED;
         continue;
       }
-      state_mask_.fetch_or(R_GREETED);
+      state_mask_ |= R_GREETED;
       continue;
     }
 
     // 3. Initiate full sync
-    if ((state_mask_.load() & R_SYNC_OK) == 0) {
-      if (HasDflyMaster())
-        ec = InitiateDflySync();
-      else
+    if ((state_mask_ & R_SYNC_OK) == 0) {
+      if (HasDflyMaster()) {
+        ec = InitiateDflySync(std::exchange(last_master_sync_data, nullopt));
+      } else
         ec = InitiatePSync();
 
       if (ec) {
-        LOG(WARNING) << "Error syncing with " << server().Description() << " " << ec << " "
-                     << ec.message();
-        state_mask_.fetch_and(R_ENABLED);  // reset all flags besides R_ENABLED
+        LOG(WARNING) << "Error syncing with " << server().Description()
+                     << " (phase: " << GetCurrentPhase() << "): " << ec << " " << ec.message()
+                     << ", socket state: " + GetSocketInfo(Sock()->native_handle());
+        state_mask_ &= R_ENABLED;  // reset all flags besides R_ENABLED
         continue;
       }
-      state_mask_.fetch_or(R_SYNC_OK);
+      state_mask_ |= R_SYNC_OK;
       continue;
     }
 
     // 4. Start stable state sync.
-    DCHECK(state_mask_.load() & R_SYNC_OK);
+    DCHECK(state_mask_ & R_SYNC_OK);
 
     if (HasDflyMaster())
       ec = ConsumeDflyStream();
     else
       ec = ConsumeRedisStream();
 
-    auto state = state_mask_.fetch_and(R_ENABLED);
+    auto state = state_mask_ &= R_ENABLED;
     if (state & R_ENABLED) {  // replication was not stopped.
-      LOG(WARNING) << "Error stable sync with " << server().Description() << " " << ec << " "
-                   << ec.message();
+      LOG(WARNING) << "Error stable sync with " << server().Description()
+                   << " (phase: " << GetCurrentPhase() << "): " << ec << " " << ec.message()
+                   << ", socket state: " + GetSocketInfo(Sock()->native_handle());
     }
   }
 
@@ -311,7 +340,7 @@ error_code Replica::Greet() {
     PC_RETURN_ON_BAD_RESPONSE(false);
   }
 
-  state_mask_.fetch_or(R_GREETED);
+  state_mask_ |= R_GREETED;
   return error_code{};
 }
 
@@ -330,6 +359,8 @@ std::error_code Replica::HandleCapaDflyResp() {
     return make_error_code(errc::bad_message);
   }
 
+  DCHECK(proactor_ == Proactor());
+
   // If we're syncing a different replication ID, drop the saved LSNs.
   string_view master_repl_id = ToSV(LastResponseArgs()[0].GetBuf());
   if (master_context_.master_repl_id != master_repl_id) {
@@ -337,7 +368,7 @@ std::error_code Replica::HandleCapaDflyResp() {
         !master_context_.master_repl_id.empty()) {
       LOG(ERROR) << "Encountered different master repl id (" << master_repl_id << " vs "
                  << master_context_.master_repl_id << ")";
-      state_mask_.store(0);
+      state_mask_ = 0;
       return make_error_code(errc::connection_aborted);
     }
     last_journal_LSNs_.reset();
@@ -405,7 +436,7 @@ error_code Replica::InitiatePSync() {
   if (snapshot_size || token != nullptr) {
     LOG(INFO) << "Starting full sync with Redis master";
 
-    state_mask_.fetch_or(R_SYNCING);
+    state_mask_ |= R_SYNCING;
 
     io::PrefixSource ps{io_buf.InputBuffer(), Sock()};
 
@@ -456,8 +487,8 @@ error_code Replica::InitiatePSync() {
     LOG(INFO) << "Re-established sync with Redis master with ID=" << id;
   }
 
-  state_mask_.fetch_and(~R_SYNCING);
-  state_mask_.fetch_or(R_SYNC_OK);
+  state_mask_ &= ~R_SYNCING;
+  state_mask_ |= R_SYNC_OK;
 
   // There is a data race condition in Redis-master code, where "ACK 0" handler may be
   // triggered before Redis is ready to transition to the streaming state and it silenty ignores
@@ -468,7 +499,7 @@ error_code Replica::InitiatePSync() {
 }
 
 // Initialize and start sub-replica for each flow.
-error_code Replica::InitiateDflySync() {
+error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_master_sync_data) {
   auto start_time = absl::Now();
 
   // Initialize MultiShardExecution.
@@ -509,13 +540,13 @@ error_code Replica::InitiateDflySync() {
   }
 
   // Start full sync flows.
-  state_mask_.fetch_or(R_SYNCING);
+  state_mask_ |= R_SYNCING;
 
   absl::Cleanup cleanup = [this]() {
     // We do the following operations regardless of outcome.
     JoinDflyFlows();
     service_.RemoveLoadingState();
-    state_mask_.fetch_and(~R_SYNCING);
+    state_mask_ &= ~R_SYNCING;
     last_journal_LSNs_.reset();
   };
 
@@ -524,13 +555,18 @@ error_code Replica::InitiateDflySync() {
     unsigned num_df_flows = shard_flows_.size();
     // Going out of the way to avoid using std::vector<bool>...
     auto is_full_sync = std::make_unique<bool[]>(num_df_flows);
+    // The elements of this bool array are not always initialized but we call std::accumulate below
+    // unconditionally. For some cases this will accumulate whatever junk that uninitialized memory
+    // cell contain. Do not remove the memset below.
+    std::memset(is_full_sync.get(), 0, num_df_flows);
     DCHECK(!last_journal_LSNs_ || last_journal_LSNs_->size() == num_df_flows);
     auto shard_cb = [&](unsigned index, auto*) {
       for (auto id : thread_flow_map_[index]) {
         auto ec = shard_flows_[id]->StartSyncFlow(sync_block, &exec_st_,
                                                   last_journal_LSNs_.has_value()
                                                       ? std::optional((*last_journal_LSNs_)[id])
-                                                      : std::nullopt);
+                                                      : std::nullopt,
+                                                  last_master_sync_data);
         if (ec.has_value())
           is_full_sync[id] = ec.value();
         else
@@ -542,7 +578,11 @@ error_code Replica::InitiateDflySync() {
     lock_guard lk{flows_op_mu_};
 
     shard_set->pool()->AwaitFiberOnAll(std::move(shard_cb));
+    if (last_journal_LSNs_) {
+      ++psync_attempts_;
+    }
 
+    last_journal_LSNs_.reset();
     size_t num_full_flows =
         std::accumulate(is_full_sync.get(), is_full_sync.get() + num_df_flows, 0);
 
@@ -558,7 +598,6 @@ error_code Replica::InitiateDflySync() {
     } else if (num_full_flows == 0) {
       sync_type = "partial";
     } else {
-      last_journal_LSNs_.reset();
       exec_st_.ReportError(std::make_error_code(errc::state_not_recoverable),
                            "Won't do a partial sync: some flows must fully resync");
     }
@@ -592,6 +631,10 @@ error_code Replica::InitiateDflySync() {
   // Joining flows and resetting state is done by cleanup.
   double seconds = double(absl::ToInt64Milliseconds(absl::Now() - start_time)) / 1000;
   LOG(INFO) << sync_type << " sync finished in " << strings::HumanReadableElapsedTime(seconds);
+
+  if (sync_type == "partial") {
+    ++psync_successes_;
+  }
 
   return exec_st_.GetError();
 }
@@ -635,7 +678,10 @@ error_code Replica::ConsumeRedisStream() {
   while (true) {
     auto response = ReadRespReply(&io_buf, /*copy_msg=*/false);
     if (!response.has_value()) {
-      VLOG(1) << "ConsumeRedisStream finished";
+      LOG_REPL_ERROR("Error in Redis Stream at phase "
+                     << GetCurrentPhase() << " with " << server().Description()
+                     << ", error: " << response.error()
+                     << ", socket state: " + GetSocketInfo(Sock()->native_handle()));
       exec_st_.ReportError(response.error());
       acks_fb_.JoinIfNeeded();
       return response.error();
@@ -673,6 +719,11 @@ error_code Replica::ConsumeDflyStream() {
   auto err_handler = [this](const auto& ge) {
     // Make sure the flows are not in a state transition
     lock_guard lk{flows_op_mu_};
+
+    LOG_REPL_ERROR("Replication error in phase "
+                   << GetCurrentPhase() << " with " << server().Description() << ", error: "
+                   << ge.Format() << ", socket state: " + GetSocketInfo(Sock()->native_handle()));
+
     DefaultErrorHandler(ge);
     for (auto& flow : shard_flows_) {
       flow->Cancel();
@@ -734,8 +785,9 @@ error_code Replica::SendNextPhaseRequest(string_view kind) {
   return std::error_code{};
 }
 
-io::Result<bool> DflyShardReplica::StartSyncFlow(BlockingCounter sb, ExecutionState* cntx,
-                                                 std::optional<LSN> lsn) {
+io::Result<bool> DflyShardReplica::StartSyncFlow(
+    BlockingCounter sb, ExecutionState* cntx, std::optional<LSN> lsn,
+    std::optional<Replica::LastMasterSyncData> last_master_data) {
   using nonstd::make_unexpected;
   DCHECK(!master_context_.master_repl_id.empty() && !master_context_.dfly_session_id.empty());
   proactor_index_ = ProactorBase::me()->GetPoolIndex();
@@ -746,12 +798,19 @@ io::Result<bool> DflyShardReplica::StartSyncFlow(BlockingCounter sb, ExecutionSt
   VLOG(1) << "Sending on flow " << master_context_.master_repl_id << " "
           << master_context_.dfly_session_id << " " << flow_id_;
 
+  // DFLY FLOW <master_id> <session_id> <flow_id> [lsn] [last_master_id lsn-vec]
   std::string cmd = StrCat("DFLY FLOW ", master_context_.master_repl_id, " ",
                            master_context_.dfly_session_id, " ", flow_id_);
   // Try to negotiate a partial sync if possible.
   if (lsn.has_value() && master_context_.version > DflyVersion::VER1 &&
       absl::GetFlag(FLAGS_replica_partial_sync)) {
     absl::StrAppend(&cmd, " ", *lsn);
+  }
+  if (last_master_data && master_context_.version >= DflyVersion::VER5 &&
+      absl::GetFlag(FLAGS_replica_partial_sync)) {
+    string lsn_str = absl::StrJoin(last_master_data.value().last_journal_LSNs, "-");
+    absl::StrAppend(&cmd, " ", last_master_data.value().id, " ", lsn_str);
+    VLOG(1) << "Sending last master sync flow " << last_master_data.value().id << " " << lsn_str;
   }
 
   ResetParser(RedisParser::Mode::CLIENT);
@@ -810,6 +869,13 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
     }
   });
 
+  // In the no point-in-time replication flow, it's possible to serialize a journal change
+  // before serializing the bucket that the key was updated in on the master side. As a result,
+  // when loading the serialized bucket data on the replica, it may overwrite the earlier entry
+  // added by the journal change. This is an expected and valid scenario, so to avoid unnecessary
+  // warnings, we enable SetOverrideExistingKeys(true).
+  rdb_loader_->SetOverrideExistingKeys(true);
+
   // Load incoming rdb stream.
   if (std::error_code ec = rdb_loader_->Load(&ps); ec) {
     cntx->ReportError(ec, "Error loading rdb format");
@@ -833,7 +899,7 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
 
   // Keep loader leftover.
   io::Bytes unused = chained_tail.UnusedPrefix();
-  if (unused.size() > 0) {
+  if (!unused.empty()) {
     leftover_buf_.emplace(unused.size());
     leftover_buf_->WriteAndCommit(unused.data(), unused.size());
   } else {
@@ -877,8 +943,17 @@ void DflyShardReplica::StableSyncDflyReadFb(ExecutionState* cntx) {
       force_ping_ = true;
       journal_rec_executed_.fetch_add(1, std::memory_order_relaxed);
     } else {
-      ExecuteTx(std::move(*tx_data), cntx);
-      journal_rec_executed_.fetch_add(1, std::memory_order_relaxed);
+      const bool is_successful = ExecuteTx(std::move(*tx_data), cntx);
+      if (is_successful) {
+        // We only increment upon successful execution of the transaction.
+        // The reason for this is that during partial sync we sent this
+        // number as the lsn number to resume from. However, if for example
+        // we increment this when a command fails (because the context
+        // got cancelled, e.g, replication connection broke), we will get
+        // inconsistent data because the replica will resume from the next
+        // lsn of the master and this lsn entry will be lost.
+        journal_rec_executed_.fetch_add(1, std::memory_order_relaxed);
+      }
     }
     shard_replica_waker_.notifyAll();
   }
@@ -958,15 +1033,14 @@ DflyShardReplica::~DflyShardReplica() {
   JoinFlow();
 }
 
-void DflyShardReplica::ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx) {
+bool DflyShardReplica::ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx) {
   if (!cntx->IsRunning()) {
-    return;
+    return false;
   }
 
   if (!tx_data.IsGlobalCmd()) {
     VLOG(3) << "Execute cmd without sync between shards. txid: " << tx_data.txid;
-    executor_->Execute(tx_data.dbid, tx_data.command);
-    return;
+    return executor_->Execute(tx_data.dbid, tx_data.command) == facade::DispatchResult::OK;
   }
 
   bool inserted_by_me =
@@ -981,7 +1055,7 @@ void DflyShardReplica::ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx
   multi_shard_data.block->Wait();
   // Check if we woke up due to cancellation.
   if (!exec_st_.IsRunning())
-    return;
+    return false;
   VLOG(2) << "Execute txid: " << tx_data.txid << " block wait finished";
 
   VLOG(2) << "Execute txid: " << tx_data.txid << " global command execution";
@@ -989,18 +1063,19 @@ void DflyShardReplica::ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx
   multi_shard_data.barrier.Wait();
   // Check if we woke up due to cancellation.
   if (!exec_st_.IsRunning())
-    return;
+    return false;
   // Global command will be executed only from one flow fiber. This ensure corectness of data in
   // replica.
+  bool execution_res = true;
   if (inserted_by_me) {
-    executor_->Execute(tx_data.dbid, tx_data.command);
+    execution_res = executor_->Execute(tx_data.dbid, tx_data.command) == facade::DispatchResult::OK;
   }
   // Wait until exection is done, to make sure we done execute next commands while the global is
   // executed.
   multi_shard_data.barrier.Wait();
   // Check if we woke up due to cancellation.
   if (!exec_st_.IsRunning())
-    return;
+    return false;
 
   // Erase from map can be done only after all flow fibers executed the transaction commands.
   // The last fiber which will decrease the counter to 0 will be the one to erase the data from
@@ -1010,6 +1085,7 @@ void DflyShardReplica::ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx
   if (val == 1) {
     multi_shard_exe_->Erase(tx_data.txid);
   }
+  return execution_res;
 }
 
 error_code Replica::ParseReplicationHeader(base::IoBuf* io_buf, PSyncResponse* dest) {
@@ -1103,9 +1179,9 @@ auto Replica::GetSummary() const -> Summary {
     Summary res;
     res.host = server().host;
     res.port = server().port;
-    res.master_link_established = (state_mask_.load() & R_TCP_CONNECTED);
-    res.full_sync_in_progress = (state_mask_.load() & R_SYNCING);
-    res.full_sync_done = (state_mask_.load() & R_SYNC_OK);
+    res.master_link_established = (state_mask_ & R_TCP_CONNECTED);
+    res.full_sync_in_progress = (state_mask_ & R_SYNCING);
+    res.full_sync_done = (state_mask_ & R_SYNC_OK);
 
     uint64_t current_time = ProactorBase::GetMonotonicTimeNs();
     // last_io_time is derived above by reading last_io_time_ from all the flows,
@@ -1123,6 +1199,8 @@ auto Replica::GetSummary() const -> Summary {
     for (uint64_t offs : GetReplicaOffset()) {
       res.repl_offset_sum += offs;
     }
+    res.psync_successes = psync_successes_;
+    res.psync_attempts = psync_attempts_;
     return res;
   };
 
@@ -1155,6 +1233,21 @@ std::vector<uint64_t> Replica::GetReplicaOffset() const {
 
 std::string Replica::GetSyncId() const {
   return master_context_.dfly_session_id;
+}
+
+std::string Replica::GetCurrentPhase() const {
+  if (!(state_mask_ & R_ENABLED))
+    return "DISABLED";
+  if (!(state_mask_ & R_TCP_CONNECTED))
+    return "TCP_CONNECTING";
+  if (!(state_mask_ & R_GREETED))
+    return "GREETING";
+  if (!(state_mask_ & R_SYNC_OK))
+    return "INITIAL_SYNC";
+  if (state_mask_ & R_SYNCING)
+    return "FULL_SYNC_IN_PROGRESS";
+
+  return "STABLE_SYNC";
 }
 
 uint32_t DflyShardReplica::FlowId() const {

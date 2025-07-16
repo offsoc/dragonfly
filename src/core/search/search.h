@@ -41,9 +41,15 @@ struct SchemaField {
   struct TagParams {
     char separator = ',';
     bool case_sensitive = false;
+    bool with_suffixtrie = false;  // see TextParams
   };
 
-  using ParamsVariant = std::variant<std::monostate, VectorParams, TagParams>;
+  struct TextParams {
+    // if enabled, suffix trie is build for efficient suffix and infix queries
+    bool with_suffixtrie = false;
+  };
+
+  using ParamsVariant = std::variant<std::monostate, VectorParams, TagParams, TextParams>;
 
   FieldType type;
   uint8_t flags;
@@ -124,14 +130,11 @@ struct AlgorithmProfile {
 struct SearchResult {
   size_t total;  // how many documents were matched in total
 
-  // number of matches before any aggregation, used by multi-shard optimizations
-  size_t pre_aggregation_total;
-
   // The ids of the matched documents
   std::vector<DocId> ids;
 
   // Contains final scores if an aggregation was present
-  std::vector<ResultScore> scores;
+  std::vector<std::pair<DocId, float>> knn_scores;
 
   // If profiling was enabled
   std::optional<AlgorithmProfile> profile;
@@ -140,9 +143,8 @@ struct SearchResult {
   std::string error;
 };
 
-struct AggregationInfo {
-  std::string_view alias;
-  bool descending;
+struct KnnScoreSortOption {
+  std::string_view score_field_alias;
   size_t limit = std::numeric_limits<size_t>::max();
 };
 
@@ -153,13 +155,12 @@ class SearchAlgorithm {
   ~SearchAlgorithm();
 
   // Init with query and return true if successful.
-  bool Init(std::string_view query, const QueryParams* params, const SortOption* sort = nullptr);
+  bool Init(std::string_view query, const QueryParams* params);
 
-  SearchResult Search(const FieldIndices* index,
-                      size_t limit = std::numeric_limits<size_t>::max()) const;
+  SearchResult Search(const FieldIndices* index) const;
 
   // if enabled, return limit & alias for knn query
-  std::optional<AggregationInfo> GetAggregationInfo() const;
+  std::optional<KnnScoreSortOption> GetKnnScoreSortOption() const;
 
   void EnableProfiling();
 

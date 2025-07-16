@@ -5,7 +5,6 @@
 #pragma once
 
 #include <absl/container/fixed_array.h>
-#include <mimalloc.h>
 #include <sys/socket.h>
 
 #include <deque>
@@ -24,7 +23,6 @@
 #include "util/http/http_handler.h"
 
 typedef struct ssl_ctx_st SSL_CTX;
-typedef struct mi_heap_s mi_heap_t;
 
 // need to declare for older linux distributions like CentOS 7
 #ifndef SO_INCOMING_CPU
@@ -91,7 +89,7 @@ class Connection : public util::Connection {
 
     // mi_stl_allocator uses mi heap internally.
     // The capacity is chosen so that we allocate a fully utilized (256 bytes) block.
-    using StorageType = absl::InlinedVector<char, kReqStorageSize, mi_stl_allocator<char>>;
+    using StorageType = absl::InlinedVector<char, kReqStorageSize>;
 
     absl::InlinedVector<std::string_view, 6> args;
     StorageType storage;
@@ -132,14 +130,9 @@ class Connection : public util::Connection {
     bool invalidate_due_to_flush = false;
   };
 
-  struct MessageDeleter {
-    void operator()(PipelineMessage* msg) const;
-    void operator()(PubMessage* msg) const;
-  };
-
   // Requests are allocated on the mimalloc heap and thus require a custom deleter.
-  using PipelineMessagePtr = std::unique_ptr<PipelineMessage, MessageDeleter>;
-  using PubMessagePtr = std::unique_ptr<PubMessage, MessageDeleter>;
+  using PipelineMessagePtr = std::unique_ptr<PipelineMessage>;
+  using PubMessagePtr = std::unique_ptr<PubMessage>;
 
   using MCPipelineMessagePtr = std::unique_ptr<MCPipelineMessage>;
   using AclUpdateMessagePtr = std::unique_ptr<AclUpdateMessage>;
@@ -162,6 +155,10 @@ class Connection : public util::Connection {
 
     bool IsPubMsg() const {
       return std::holds_alternative<PubMessagePtr>(handle);
+    }
+
+    bool IsMonitor() const {
+      return std::holds_alternative<MonitorMessage>(handle);
     }
 
     bool IsReplying() const;  // control messges don't reply, messages carrying data do
@@ -199,7 +196,7 @@ class Connection : public util::Connection {
     // Returns client id.Thread-safe.
     uint32_t GetClientId() const;
 
-    bool operator<(const WeakRef& other);
+    bool operator<(const WeakRef& other) const;
     bool operator==(const WeakRef& other) const;
 
    private:
@@ -277,6 +274,11 @@ class Connection : public util::Connection {
     return name_;
   }
 
+  // Returns protocol type of this connection
+  Protocol GetProtocol() const {
+    return protocol_;
+  }
+
   struct MemoryUsage {
     size_t mem = 0;
     io::IoBuf::MemoryUsage buf_mem;
@@ -312,6 +314,8 @@ class Connection : public util::Connection {
   unsigned idle_time() const {
     return time(nullptr) - last_interaction_;
   }
+
+  unsigned GetSendWaitTimeSec() const;
 
   Phase phase() const {
     return phase_;
@@ -359,9 +363,9 @@ class Connection : public util::Connection {
   void RecycleMessage(MessageHandle msg);
 
   // Create new pipeline request, re-use from pool when possible.
-  PipelineMessagePtr FromArgs(RespVec args, mi_heap_t* heap);
+  PipelineMessagePtr FromArgs(const RespVec& args);
 
-  ParserStatus ParseRedis();
+  ParserStatus ParseRedis(unsigned max_busy_cycles);
   ParserStatus ParseMemcache();
 
   void OnBreakCb(int32_t mask);
@@ -416,11 +420,14 @@ class Connection : public util::Connection {
   void IncrNumConns();
   void DecrNumConns();
 
+  bool IsReplySizeOverLimit() const;
+
   std::deque<MessageHandle> dispatch_q_;  // dispatch queue
   util::fb2::CondVarAny cnd_;             // dispatch queue waker
   util::fb2::Fiber async_fb_;             // async fiber (if started)
 
   uint64_t pending_pipeline_cmd_cnt_ = 0;  // how many queued Redis async commands in dispatch_q
+  size_t pending_pipeline_bytes_ = 0;      // how many bytes of the queued Redis async commands
 
   // how many bytes of the current request have been consumed
   size_t request_consumed_bytes_ = 0;
@@ -449,10 +456,6 @@ class Connection : public util::Connection {
 
   unsigned parser_error_ = 0;
 
-  // amount of times we enqued requests asynchronously during the same async_fiber_epoch_.
-  unsigned async_streak_len_ = 0;
-  uint64_t async_fiber_epoch_ = 0;
-
   BreakerCb breaker_cb_;
 
   // Used by redis parser to avoid allocations
@@ -479,6 +482,9 @@ class Connection : public util::Connection {
       bool migration_enabled_ : 1;
       bool migration_in_process_ : 1;
       bool is_http_ : 1;
+
+      // whether the connection is TLS. We can be sure our socket is TlsSocket
+      // if the flag is set.
       bool is_tls_ : 1;
       bool recv_provided_ : 1;
       bool is_main_ : 1;

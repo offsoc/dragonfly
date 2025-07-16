@@ -2,6 +2,7 @@
 Test compatibility with the redis-py client search module.
 Search correctness should be ensured with unit tests.
 """
+
 import pytest
 from redis import asyncio as aioredis
 from .utility import *
@@ -280,7 +281,6 @@ NUM_POINTS = 100
 @dfly_args({"proactor_threads": 4})
 @pytest.mark.parametrize("index_type", [IndexType.HASH, IndexType.JSON])
 @pytest.mark.parametrize("algo_type", ["HNSW", "FLAT"])
-@pytest.mark.skip("Fails on ARM")
 async def test_multidim_knn(async_client: aioredis.Redis, index_type, algo_type):
     vector_field = VectorField(
         "pos",
@@ -297,6 +297,9 @@ async def test_multidim_knn(async_client: aioredis.Redis, index_type, algo_type)
         fix_schema_naming(index_type, [vector_field]),
         definition=IndexDefinition(index_type=index_type),
     )
+
+    # Use fixed seed for deterministic results
+    np.random.seed(42)
 
     def rand_point():
         return np.random.uniform(0, 10, NUM_DIMS).astype(np.float32)
@@ -316,7 +319,9 @@ async def test_multidim_knn(async_client: aioredis.Redis, index_type, algo_type)
     # Run 10 random queries
     for _ in range(10):
         center = rand_point()
-        limit = random.randint(1, NUM_POINTS / 10)
+        limit = np.random.randint(
+            1, NUM_POINTS // 10 + 1
+        )  # +1 because numpy's randint is exclusive
 
         expected_ids = [
             f"k{i}"
@@ -485,7 +490,7 @@ def test_redis_om(df_server):
     try:
         import redis_om
     except ModuleNotFoundError:
-        skip_if_not_in_github()
+        skip_if_not_in_github("redis-om python library not installed")
         raise
 
     client = redis.Redis(port=df_server.port)

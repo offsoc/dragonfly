@@ -156,6 +156,15 @@ TEST_F(HllFamilyTest, CountMultiple) {
   EXPECT_EQ(CheckedInt({"pfcount", "key1", "key4"}), 5);
 }
 
+TEST_F(HllFamilyTest, CountMultipleWithWrongType) {
+  EXPECT_EQ(Run({"set", "key1", "value1"}), "OK");
+  EXPECT_EQ(CheckedInt({"pfadd", "key", "value"}), 1);
+  EXPECT_EQ(CheckedInt({"pfadd", "list1 element1", "data"}), 1);
+
+  EXPECT_THAT(Run({"pfcount", "key1", "key", "list1 element1"}),
+              ErrArg("INVALIDOBJ Corrupted HLL object detected."));
+}
+
 TEST_F(HllFamilyTest, MergeToNew) {
   EXPECT_EQ(CheckedInt({"pfadd", "key1", "1", "2", "3"}), 1);
   EXPECT_EQ(CheckedInt({"pfadd", "key2", "4", "5"}), 1);
@@ -194,10 +203,30 @@ TEST_F(HllFamilyTest, MergeOverlapping) {
 }
 
 TEST_F(HllFamilyTest, MergeInvalid) {
+  Run({"exists", "key1", "key4"});
+  ASSERT_EQ(GetDebugInfo().shards_count, 2);  // ensure 2 shards
+
   EXPECT_EQ(CheckedInt({"pfadd", "key1", "1", "2", "3"}), 1);
-  EXPECT_EQ(Run({"set", "key2", "..."}), "OK");
-  EXPECT_THAT(Run({"pfmerge", "key1", "key2"}), ErrArg(HllFamily::kInvalidHllErr));
+  EXPECT_EQ(Run({"set", "key4", "..."}), "OK");
+  EXPECT_THAT(Run({"pfmerge", "key1", "key4"}),
+              ErrArg("INVALIDOBJ Corrupted HLL object detected."));
   EXPECT_EQ(CheckedInt({"pfcount", "key1"}), 3);
+}
+
+TEST_F(HllFamilyTest, MergeWithInvalidHllFormat) {
+  EXPECT_EQ(CheckedInt({"pfadd", "complex@key \"weird!field\" \"value\\nwith\\tescape sequences\"",
+                        "some_element"}),
+            1);
+  EXPECT_EQ(CheckedInt({"append", "complex@key \"weird!field\" \"value\\nwith\\tescape sequences\"",
+                        "corrupt_data"}),
+            33);
+  EXPECT_EQ(CheckedInt({"pfadd", "\"key with \\\"quotes\\\"\" \"value with \\\\backslashes\\\\\"",
+                        "element1"}),
+            1);
+  EXPECT_THAT(Run({"pfmerge", "result_key",
+                   "complex@key \"weird!field\" \"value\\nwith\\tescape sequences\"",
+                   "\"key with \\\"quotes\\\"\" \"value with \\\\backslashes\\\\\""}),
+              ErrArg("INVALIDOBJ Corrupted HLL object detected."));
 }
 
 }  // namespace dfly
